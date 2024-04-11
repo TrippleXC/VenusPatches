@@ -22,17 +22,17 @@ diff --git a/meson.build b/meson.build
 index ec01f8b138..ea52ef1b9c 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -1050,6 +1050,10 @@ if not get_option('virglrenderer').auto() or have_system or have_vhost_user_gpu
-                          cc.has_member('struct virgl_renderer_resource_info_ext', 'd3d_tex2d',
-                                        prefix: '#include <virglrenderer.h>',
-                                        dependencies: virgl))
-+    config_host_data.set('HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS',
-+                         cc.has_function('virgl_renderer_context_create_with_flags',
-+                                         prefix: '#include <virglrenderer.h>',
-+                                         dependencies: virgl))
-   endif
+@@ -2287,6 +2287,10 @@
+                        cc.has_member('struct virgl_renderer_resource_info_ext', 'd3d_tex2d',
+                                      prefix: '#include <virglrenderer.h>',
+                                      dependencies: virgl))
++  config_host_data.set('HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS',
++                       cc.has_function('virgl_renderer_context_create_with_flags',
++                                     prefix: '#include <virglrenderer.h>',
++                                     dependencies: virgl))
  endif
- rutabaga = not_found
+ config_host_data.set('CONFIG_VIRTFS', have_virtfs)
+ config_host_data.set('CONFIG_VTE', vte.found())
 -- 
 2.25.1
 
