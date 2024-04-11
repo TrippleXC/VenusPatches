@@ -1,40 +1,104 @@
-From: Huang Rui <ray.huang@amd.com>
-Subject: [PATCH v6 10/11] virtio-gpu: Initialize Venus
-Date: Tue, 19 Dec 2023 15:53:19 +0800
-Content-Type: text/plain
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v7 10/10] virtio-gpu: Initialize Venus
+Date: Thu, 11 Apr 2024 13:20:02 +0300
+Content-Type: text/plain; charset="utf-8"
 
 From: Antonio Caggiano <antonio.caggiano@collabora.com>
 
-Request Venus when initializing VirGL.
+Request Venus when initializing VirGL and if vulkan=true flag is set for
+virtio-gpu device.
 
 Signed-off-by: Antonio Caggiano <antonio.caggiano@collabora.com>
 Signed-off-by: Huang Rui <ray.huang@amd.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
 ---
-
-Changes in v6:
-- Remove the unstable API flags check because virglrenderer is already 1.0.
-- Squash the render server flag support into "Initialize Venus".
-
- hw/display/virtio-gpu-virgl.c | 4 ++++
- 1 file changed, 4 insertions(+)
+ hw/display/virtio-gpu-virgl.c  |  5 +++++
+ hw/display/virtio-gpu.c        | 15 +++++++++++++++
+ include/hw/virtio/virtio-gpu.h |  3 +++
+ meson.build                    |  1 +
+ 4 files changed, 24 insertions(+)
 
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index f35a751824..c523a6717a 100644
+index 0d8f00c7939a..c4448d663282 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -964,6 +964,10 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+@@ -1052,6 +1052,11 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
      }
  #endif
- 
 +#ifdef VIRGL_RENDERER_VENUS
-+    flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++    }
 +#endif
-+
+ 
      ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
      if (ret != 0) {
-         error_report("virgl could not be initialized: %d", ret);
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index dd8dcc441709..6130592d65cd 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1491,6 +1491,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+ #endif
+     }
+ 
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++#ifdef HAVE_VIRGL_VENUS
++        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
++            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
++            error_setg(errp, "venus requires enabled blob and hostmem options");
++            return;
++        }
++#else
++        error_setg(errp, "old virglrenderer, venus unsupported");
++        return;
++#endif
++    }
++
+     if (!virtio_gpu_base_device_realize(qdev,
+                                         virtio_gpu_handle_ctrl_cb,
+                                         virtio_gpu_handle_cursor_cb,
+@@ -1667,6 +1680,8 @@ static Property virtio_gpu_properties[] = {
+     DEFINE_PROP_BIT("blob", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
+     DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
++    DEFINE_PROP_BIT("vulkan", VirtIOGPU, parent_obj.conf.flags,
++                    VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index a16263334b47..71fbfff0258a 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -103,6 +103,7 @@ enum virtio_gpu_base_conf_flags {
+     VIRTIO_GPU_FLAG_BLOB_ENABLED,
+     VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED,
+     VIRTIO_GPU_FLAG_RUTABAGA_ENABLED,
++    VIRTIO_GPU_FLAG_VENUS_ENABLED,
+ };
+ 
+ #define virtio_gpu_virgl_enabled(_cfg) \
+@@ -121,6 +122,8 @@ enum virtio_gpu_base_conf_flags {
+     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_RUTABAGA_ENABLED))
+ #define virtio_gpu_hostmem_enabled(_cfg) \
+     (_cfg.hostmem > 0)
++#define virtio_gpu_venus_enabled(_cfg) \
++    (_cfg.flags & (1 << VIRTIO_GPU_FLAG_VENUS_ENABLED))
+ 
+ struct virtio_gpu_base_conf {
+     uint32_t max_outputs;
+diff --git a/meson.build b/meson.build
+index dcc5568bb382..040d843f054c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2286,6 +2286,7 @@ if virgl.version().version_compare('>=1.0.0')
+   config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT', 1)
+   config_host_data.set('HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS', 1)
+   config_host_data.set('HAVE_VIRGL_RESOURCE_BLOB', 1)
++  config_host_data.set('HAVE_VIRGL_VENUS', 1)
+ endif
+ config_host_data.set('CONFIG_VIRTFS', have_virtfs)
+ config_host_data.set('CONFIG_VTE', vte.found())
 -- 
-2.25.1
-
-
-
+2.44.0
