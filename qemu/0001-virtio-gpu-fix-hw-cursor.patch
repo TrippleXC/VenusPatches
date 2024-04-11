@@ -1,0 +1,43 @@
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 1c1ee230b3..1ae9be605b 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -98,6 +98,7 @@ static void update_cursor(VirtIOGPU *g, struct virtio_gpu_update_cursor *cursor)
+ 
+         s->current_cursor->hot_x = cursor->hot_x;
+         s->current_cursor->hot_y = cursor->hot_y;
++        s->current_cursor->visible = cursor->resource_id ? 1 : 0;
+ 
+         if (cursor->resource_id > 0) {
+             vgc->update_cursor_data(g, s, cursor->resource_id);
+diff --git a/include/ui/console.h b/include/ui/console.h
+index a4a49ffc64..47c39ed405 100644
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -161,6 +161,7 @@ typedef struct QEMUCursor {
+     uint16_t            width, height;
+     int                 hot_x, hot_y;
+     int                 refcount;
++    int                 visible;
+     uint32_t            data[];
+ } QEMUCursor;
+ 
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 810d7fc796..12a76de570 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -478,6 +478,11 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
+         return;
+     }
+ 
++    if(!c->visible) {
++        gdk_window_set_cursor(gtk_widget_get_window(vc->gfx.drawing_area), NULL);
++        return;
++    }
++
+     pixbuf = gdk_pixbuf_new_from_data((guchar *)(c->data),
+                                       GDK_COLORSPACE_RGB, true, 8,
+                                       c->width, c->height, c->width * 4,
+-- 
+2.33.1
+

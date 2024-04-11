@@ -1,0 +1,63 @@
+--- linux-6.8.4/drivers/gpu/drm/ttm/ttm_pool.c	2024-04-04 14:25:06.000000000 -0400
++++ /usr/src/linux/drivers/gpu/drm/ttm/ttm_pool.c	2024-04-09 11:58:31.144205251 -0400
+@@ -83,6 +83,7 @@
+ 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
+ 	struct ttm_pool_dma *dma;
+ 	struct page *p;
++	unsigned int i;
+ 	void *vaddr;
+ 
+ 	/* Don't set the __GFP_COMP flag for higher order allocations.
+@@ -95,8 +96,10 @@
+ 
+ 	if (!pool->use_dma_alloc) {
+ 		p = alloc_pages_node(pool->nid, gfp_flags, order);
+-		if (p)
++		if (p) {
+ 			p->private = order;
++			goto ref_tail_pages;
++		}
+ 		return p;
+ 	}
+ 
+@@ -122,6 +125,23 @@
+ 
+ 	dma->vaddr = (unsigned long)vaddr | order;
+ 	p->private = (unsigned long)dma;
++
++ref_tail_pages:
++	/*
++	 * KVM requires mapped tail pages to be refcounted because put_page()
++	 * is invoked on them in the end of the page fault handling, and thus,
++	 * tail pages need to be protected from the premature releasing.
++	 * In fact, KVM page fault handler refuses to map tail pages to guest
++	 * if they aren't refcounted because hva_to_pfn_remapped() checks the
++	 * refcount specifically for this case.
++	 *
++	 * In particular, unreferenced tail pages result in a KVM "Bad address"
++	 * failure for VMMs that use VirtIO-GPU when guest's Mesa VirGL driver
++	 * accesses mapped host TTM buffer that contains tail pages.
++	 */
++	for (i = 1; i < 1 << order; i++)
++		page_ref_inc(p + i);
++
+ 	return p;
+ 
+ error_free:
+@@ -135,6 +155,7 @@
+ {
+ 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
+ 	struct ttm_pool_dma *dma;
++	unsigned int i;
+ 	void *vaddr;
+ 
+ #ifdef CONFIG_X86
+@@ -144,6 +165,8 @@
+ 	if (caching != ttm_cached && !PageHighMem(p))
+ 		set_pages_wb(p, 1 << order);
+ #endif
++	for (i = 1; i < 1 << order; i++)
++		page_ref_dec(p + i);
+ 
+ 	if (!pool || !pool->use_dma_alloc) {
+ 		__free_pages(p, order);

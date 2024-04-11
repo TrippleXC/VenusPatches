@@ -1,0 +1,11 @@
+--- include/ui/console.h        2021-08-24 16:59:52.000000000 +0000
++++ b/include/ui/console.h      2021-11-02 11:24:52.304012787 +0000
+@@ -43,7 +43,7 @@
+ #define QEMU_CAPS_LOCK_LED   (1 << 2)
+ 
+ /* in ms */
+-#define GUI_REFRESH_INTERVAL_DEFAULT    30
++#define GUI_REFRESH_INTERVAL_DEFAULT    17
+ #define GUI_REFRESH_INTERVAL_IDLE     3000
+ 
+ /* Color number is match to standard vga palette */

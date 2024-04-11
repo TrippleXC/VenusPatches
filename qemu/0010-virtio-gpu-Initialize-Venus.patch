@@ -1,0 +1,40 @@
+From: Huang Rui <ray.huang@amd.com>
+Subject: [PATCH v6 10/11] virtio-gpu: Initialize Venus
+Date: Tue, 19 Dec 2023 15:53:19 +0800
+Content-Type: text/plain
+
+From: Antonio Caggiano <antonio.caggiano@collabora.com>
+
+Request Venus when initializing VirGL.
+
+Signed-off-by: Antonio Caggiano <antonio.caggiano@collabora.com>
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+---
+
+Changes in v6:
+- Remove the unstable API flags check because virglrenderer is already 1.0.
+- Squash the render server flag support into "Initialize Venus".
+
+ hw/display/virtio-gpu-virgl.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index f35a751824..c523a6717a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -964,6 +964,10 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+     }
+ #endif
+ 
++#ifdef VIRGL_RENDERER_VENUS
++    flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++#endif
++
+     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
+     if (ret != 0) {
+         error_report("virgl could not be initialized: %d", ret);
+-- 
+2.25.1
+
+
+

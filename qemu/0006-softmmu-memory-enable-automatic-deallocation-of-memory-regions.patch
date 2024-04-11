@@ -1,0 +1,63 @@
+From: Huang Rui <ray.huang@amd.com>
+Subject: [PATCH v6 06/11] softmmu/memory: enable automatic deallocation of
+ memory regions
+Date: Tue, 19 Dec 2023 15:53:15 +0800
+Content-Type: text/plain
+
+From: Xenia Ragiadakou <xenia.ragiadakou@amd.com>
+
+When the memory region has a different life-cycle from that of her parent,
+could be automatically released, once has been unparent and once all of her
+references have gone away, via the object's free callback.
+
+However, currently, the address space subsystem keeps references to the
+memory region without first incrementing its object's reference count.
+As a result, the automatic deallocation of the object, not taking into
+account those references, results in use-after-free memory corruption.
+
+More specifically, reference to the memory region is kept in flatview
+ranges. If the reference count of the memory region is not incremented,
+flatview_destroy(), that is asynchronous, may be called after memory
+region's destruction. If the reference count of the memory region is
+incremented, memory region's destruction will take place after
+flatview_destroy() has released its references.
+
+This patch increases the reference count of an owned memory region object
+on each memory_region_ref() and decreases it on each memory_region_unref().
+
+Signed-off-by: Xenia Ragiadakou <xenia.ragiadakou@amd.com>
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+---
+
+Changes in v6:
+- remove in-code comment because it is confusing and explain the issue,
+  that the patch attempts to fix, with more details in commit message
+
+ system/memory.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/system/memory.c b/system/memory.c
+index 304fa843ea..4d5e7e7a4c 100644
+--- a/system/memory.c
++++ b/system/memory.c
+@@ -1824,6 +1824,7 @@ void memory_region_ref(MemoryRegion *mr)
+      * we do not ref/unref them because it slows down DMA sensibly.
+      */
+     if (mr && mr->owner) {
++        object_ref(OBJECT(mr));
+         object_ref(mr->owner);
+     }
+ }
+@@ -1832,6 +1833,7 @@ void memory_region_unref(MemoryRegion *mr)
+ {
+     if (mr && mr->owner) {
+         object_unref(mr->owner);
++        object_unref(OBJECT(mr));
+     }
+ }
+ 
+-- 
+2.25.1
+
+
+

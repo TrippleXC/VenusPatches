@@ -1,0 +1,67 @@
+From: Huang Rui <ray.huang@amd.com>
+Subject: [PATCH v6 03/11] virtio-gpu: Support context init feature with
+ virglrenderer
+Date: Tue, 19 Dec 2023 15:53:12 +0800
+Content-Type: text/plain
+
+Patch "virtio-gpu: CONTEXT_INIT feature" has added the context_init
+feature flags.
+We would like to enable the feature with virglrenderer, so add to create
+virgl renderer context with flags using context_id when valid.
+
+Originally-by: Antonio Caggiano <antonio.caggiano@collabora.com>
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+---
+
+Changes in v6:
+- Handle the case while context_init is disabled.
+- Enable context_init by default.
+
+ hw/display/virtio-gpu-virgl.c | 13 +++++++++++--
+ hw/display/virtio-gpu.c       |  4 ++++
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 8bb7a2c21f..5bbc8071b2 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -106,8 +106,17 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
+     trace_virtio_gpu_cmd_ctx_create(cc.hdr.ctx_id,
+                                     cc.debug_name);
+ 
+-    virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen,
+-                                  cc.debug_name);
++#ifdef HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS
++    if (cc.context_init && virtio_gpu_context_init_enabled(g->parent_obj.conf)) {
++        virgl_renderer_context_create_with_flags(cc.hdr.ctx_id,
++                                                 cc.context_init,
++                                                 cc.nlen,
++                                                 cc.debug_name);
++        return;
++    }
++#endif
++
++    virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen, cc.debug_name);
+ }
+ 
+ static void virgl_cmd_context_destroy(VirtIOGPU *g,
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index b016d3bac8..8b2f4c6be3 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1619,6 +1619,10 @@ static Property virtio_gpu_properties[] = {
+     DEFINE_PROP_BIT("blob", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
+     DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
++#ifdef HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS
++    DEFINE_PROP_BIT("context_init", VirtIOGPU, parent_obj.conf.flags,
++                    VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED, true),
++#endif
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+-- 
+2.25.1
+
+
+
