@@ -1,0 +1,124 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v7 05/10] virtio-gpu: Add virgl resource management
+Date: Thu, 11 Apr 2024 13:19:57 +0300
+Content-Type: text/plain; charset="utf-8"
+
+From: Huang Rui <ray.huang@amd.com>
+
+In a preparation to adding host blobs support to virtio-gpu, add virgl
+resource management that allows to retrieve resource based on its ID.
+
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Antonio Caggiano <quic_acaggian@quicinc.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-virgl.c | 57 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index ef598d8d23ee..04f7a191c41a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -35,11 +35,34 @@ static void virgl_cmd_create_resource_2d(VirtIOGPU *g,
+ {
+     struct virtio_gpu_resource_create_2d c2d;
+     struct virgl_renderer_resource_create_args args;
++    struct virtio_gpu_simple_resource *res;
+ 
+     VIRTIO_GPU_FILL_CMD(c2d);
+     trace_virtio_gpu_cmd_res_create_2d(c2d.resource_id, c2d.format,
+                                        c2d.width, c2d.height);
+ 
++    if (c2d.resource_id == 0) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource id 0 is not allowed\n",
++                      __func__);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    res = virtio_gpu_find_resource(g, c2d.resource_id);
++    if (res) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
++                      __func__, c2d.resource_id);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    res = g_new0(struct virtio_gpu_simple_resource, 1);
++    res->width = c2d.width;
++    res->height = c2d.height;
++    res->format = c2d.format;
++    res->resource_id = c2d.resource_id;
++    QTAILQ_INSERT_HEAD(&g->reslist, res, next);
++
+     args.handle = c2d.resource_id;
+     args.target = 2;
+     args.format = c2d.format;
+@@ -59,11 +82,34 @@ static void virgl_cmd_create_resource_3d(VirtIOGPU *g,
+ {
+     struct virtio_gpu_resource_create_3d c3d;
+     struct virgl_renderer_resource_create_args args;
++    struct virtio_gpu_simple_resource *res;
+ 
+     VIRTIO_GPU_FILL_CMD(c3d);
+     trace_virtio_gpu_cmd_res_create_3d(c3d.resource_id, c3d.format,
+                                        c3d.width, c3d.height, c3d.depth);
+ 
++    if (c3d.resource_id == 0) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource id 0 is not allowed\n",
++                      __func__);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    res = virtio_gpu_find_resource(g, c3d.resource_id);
++    if (res) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource already exists %d\n",
++                      __func__, c3d.resource_id);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    res = g_new0(struct virtio_gpu_simple_resource, 1);
++    res->width = c3d.width;
++    res->height = c3d.height;
++    res->format = c3d.format;
++    res->resource_id = c3d.resource_id;
++    QTAILQ_INSERT_HEAD(&g->reslist, res, next);
++
+     args.handle = c3d.resource_id;
+     args.target = c3d.target;
+     args.format = c3d.format;
+@@ -82,12 +128,19 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
+                                      struct virtio_gpu_ctrl_command *cmd)
+ {
+     struct virtio_gpu_resource_unref unref;
++    struct virtio_gpu_simple_resource *res;
+     struct iovec *res_iovs = NULL;
+     int num_iovs = 0;
+ 
+     VIRTIO_GPU_FILL_CMD(unref);
+     trace_virtio_gpu_cmd_res_unref(unref.resource_id);
+ 
++    res = virtio_gpu_find_resource(g, unref.resource_id);
++    if (!res) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
+     virgl_renderer_resource_detach_iov(unref.resource_id,
+                                        &res_iovs,
+                                        &num_iovs);
+@@ -95,6 +148,10 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
+         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
+     }
+     virgl_renderer_resource_unref(unref.resource_id);
++
++    QTAILQ_REMOVE(&g->reslist, res, next);
++
++    g_free(res);
+ }
+ 
+ static void virgl_cmd_context_create(VirtIOGPU *g,
+-- 
+2.44.0

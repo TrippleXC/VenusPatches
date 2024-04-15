@@ -1,0 +1,36 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v7 02/10] virtio-gpu: Use pkgconfig version to decide which
+ virgl features are available
+Date: Thu, 11 Apr 2024 13:19:54 +0300
+Content-Type: text/plain; charset="utf-8"
+
+New virglrerenderer features were stabilized with release of v1.0.0.
+Presence of symbols in virglrenderer.h doesn't guarantee ABI compatibility
+with pre-release development versions of libvirglerender. Use virglrenderer
+version to decide reliably which virgl features are available.
+
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ meson.build | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index c9c3217ba4b8..f085722c89dc 100644
+--- a/meson.build
++++ b/meson.build
+@@ -2282,11 +2282,8 @@ config_host_data.set('CONFIG_PNG', png.found())
+ config_host_data.set('CONFIG_VNC', vnc.found())
+ config_host_data.set('CONFIG_VNC_JPEG', jpeg.found())
+ config_host_data.set('CONFIG_VNC_SASL', sasl.found())
+-if virgl.found()
+-  config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT',
+-                       cc.has_member('struct virgl_renderer_resource_info_ext', 'd3d_tex2d',
+-                                     prefix: '#include <virglrenderer.h>',
+-                                     dependencies: virgl))
++if virgl.version().version_compare('>=1.0.0')
++  config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT', 1)
+ endif
+ config_host_data.set('CONFIG_VIRTFS', have_virtfs)
+ config_host_data.set('CONFIG_VTE', vte.found())
+-- 
+2.44.0
