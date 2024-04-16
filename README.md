@@ -1,0 +1,1 @@
+You can download the patches and apply them manually or download prepatched source code in the releases section. Both need to be compiled, but the source offered in the releases section can be a bit more user friendly because no patching is required.
