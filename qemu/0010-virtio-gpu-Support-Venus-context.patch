@@ -1,28 +1,21 @@
-From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
-Subject: [PATCH v7 10/10] virtio-gpu: Initialize Venus
-Date: Thu, 11 Apr 2024 13:20:02 +0300
-Content-Type: text/plain; charset="utf-8"
-
-From: Antonio Caggiano <antonio.caggiano@collabora.com>
-
-Request Venus when initializing VirGL and if vulkan=true flag is set for
-virtio-gpu device.
-
-Signed-off-by: Antonio Caggiano <antonio.caggiano@collabora.com>
-Signed-off-by: Huang Rui <ray.huang@amd.com>
-Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
----
- hw/display/virtio-gpu-virgl.c  |  5 +++++
- hw/display/virtio-gpu.c        | 15 +++++++++++++++
- include/hw/virtio/virtio-gpu.h |  3 +++
- meson.build                    |  1 +
- 4 files changed, 24 insertions(+)
-
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 431fc2881a00..1deb3e64b781 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -137,6 +137,8 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+ static Property virtio_gpu_gl_properties[] = {
+     DEFINE_PROP_BIT("stats", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_STATS_ENABLED, false),
++    DEFINE_PROP_BIT("venus", VirtIOGPU, parent_obj.conf.flags,
++                    VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 0d8f00c7939a..c4448d663282 100644
+index 135974431492..f1cad005dd8f 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -1052,6 +1052,11 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+@@ -1094,6 +1094,11 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
          flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
      }
  #endif
@@ -34,8 +27,42 @@ index 0d8f00c7939a..c4448d663282 100644
  
      ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
      if (ret != 0) {
+@@ -1124,7 +1129,7 @@ static void virtio_gpu_virgl_add_capset(GArray *capset_ids, uint32_t capset_id)
+ 
+ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
+ {
+-    uint32_t capset2_max_ver, capset2_max_size;
++    uint32_t capset_max_ver, capset_max_size;
+     GArray *capset_ids;
+ 
+     capset_ids = g_array_new(false, false, sizeof(uint32_t));
+@@ -1133,12 +1138,21 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
+     virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
+ 
+     virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+-                              &capset2_max_ver,
+-                              &capset2_max_size);
+-    if (capset2_max_ver) {
++                               &capset_max_ver,
++                               &capset_max_size);
++    if (capset_max_ver) {
+         virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+     }
+ 
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VENUS,
++                                   &capset_max_ver,
++                                   &capset_max_size);
++        if (capset_max_size) {
++            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VENUS);
++        }
++    }
++
+     return capset_ids;
+ }
+ 
 diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
-index dd8dcc441709..6130592d65cd 100644
+index 052ab493a00b..0518bb858e88 100644
 --- a/hw/display/virtio-gpu.c
 +++ b/hw/display/virtio-gpu.c
 @@ -1491,6 +1491,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
@@ -58,20 +85,11 @@ index dd8dcc441709..6130592d65cd 100644
      if (!virtio_gpu_base_device_realize(qdev,
                                          virtio_gpu_handle_ctrl_cb,
                                          virtio_gpu_handle_cursor_cb,
-@@ -1667,6 +1680,8 @@ static Property virtio_gpu_properties[] = {
-     DEFINE_PROP_BIT("blob", VirtIOGPU, parent_obj.conf.flags,
-                     VIRTIO_GPU_FLAG_BLOB_ENABLED, false),
-     DEFINE_PROP_SIZE("hostmem", VirtIOGPU, parent_obj.conf.hostmem, 0),
-+    DEFINE_PROP_BIT("vulkan", VirtIOGPU, parent_obj.conf.flags,
-+                    VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
-     DEFINE_PROP_END_OF_LIST(),
- };
- 
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index a16263334b47..71fbfff0258a 100644
+index 7bbc6ef268eb..9940bbcbaacc 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
-@@ -103,6 +103,7 @@ enum virtio_gpu_base_conf_flags {
+@@ -99,6 +99,7 @@ enum virtio_gpu_base_conf_flags {
      VIRTIO_GPU_FLAG_BLOB_ENABLED,
      VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED,
      VIRTIO_GPU_FLAG_RUTABAGA_ENABLED,
@@ -79,7 +97,7 @@ index a16263334b47..71fbfff0258a 100644
  };
  
  #define virtio_gpu_virgl_enabled(_cfg) \
-@@ -121,6 +122,8 @@ enum virtio_gpu_base_conf_flags {
+@@ -117,6 +118,8 @@ enum virtio_gpu_base_conf_flags {
      (_cfg.flags & (1 << VIRTIO_GPU_FLAG_RUTABAGA_ENABLED))
  #define virtio_gpu_hostmem_enabled(_cfg) \
      (_cfg.hostmem > 0)
@@ -89,10 +107,10 @@ index a16263334b47..71fbfff0258a 100644
  struct virtio_gpu_base_conf {
      uint32_t max_outputs;
 diff --git a/meson.build b/meson.build
-index dcc5568bb382..040d843f054c 100644
+index 0433ea200dd7..20241931730f 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -2286,6 +2286,7 @@ if virgl.version().version_compare('>=1.0.0')
+@@ -2290,6 +2290,7 @@ if virgl.version().version_compare('>=1.0.0')
    config_host_data.set('HAVE_VIRGL_D3D_INFO_EXT', 1)
    config_host_data.set('HAVE_VIRGL_CONTEXT_CREATE_WITH_FLAGS', 1)
    config_host_data.set('HAVE_VIRGL_RESOURCE_BLOB', 1)
@@ -100,5 +118,3 @@ index dcc5568bb382..040d843f054c 100644
  endif
  config_host_data.set('CONFIG_VIRTFS', have_virtfs)
  config_host_data.set('CONFIG_VTE', vte.found())
--- 
-2.44.0

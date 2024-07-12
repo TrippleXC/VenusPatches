@@ -1,0 +1,58 @@
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index e06be60dfbfc..0c0a8d136954 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -136,6 +136,16 @@ static Property virtio_gpu_gl_properties[] = {
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
++static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
++{
++    VirtIOGPU *g = VIRTIO_GPU(qdev);
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(qdev);
++
++    if (gl->renderer_inited) {
++        virtio_gpu_virgl_deinit(g);
++    }
++}
++
+ static void virtio_gpu_gl_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -149,6 +159,7 @@ static void virtio_gpu_gl_class_init(ObjectClass *klass, void *data)
+     vgc->update_cursor_data = virtio_gpu_gl_update_cursor_data;
+ 
+     vdc->realize = virtio_gpu_gl_device_realize;
++    vdc->unrealize = virtio_gpu_gl_device_unrealize;
+     vdc->reset = virtio_gpu_gl_reset;
+     device_class_set_props(dc, virtio_gpu_gl_properties);
+ }
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 9f34d0e6619c..b0500eccf8e0 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -665,3 +665,12 @@ int virtio_gpu_virgl_get_num_capsets(VirtIOGPU *g)
+ 
+     return capset2_max_ver ? 2 : 1;
+ }
++
++void virtio_gpu_virgl_deinit(VirtIOGPU *g)
++{
++    if (g->fence_poll) {
++        timer_free(g->fence_poll);
++    }
++
++    virgl_renderer_cleanup(NULL);
++}
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index ed44cdad6b34..b657187159d9 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -336,6 +336,7 @@ void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset(VirtIOGPU *g);
+ int virtio_gpu_virgl_init(VirtIOGPU *g);
++void virtio_gpu_virgl_deinit(VirtIOGPU *g);
+ int virtio_gpu_virgl_get_num_capsets(VirtIOGPU *g);
+ 
+ #endif

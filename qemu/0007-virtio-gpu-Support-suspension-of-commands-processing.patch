@@ -1,0 +1,16 @@
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 1e57a53d346c..6c8c7213bafa 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1054,6 +1054,11 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         /* process command */
+         vgc->process_cmd(g, cmd);
+ 
++        /* command suspended */
++        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
++            break;
++        }
++
+         QTAILQ_REMOVE(&g->cmdq, cmd, next);
+         if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+             g->stats.requests++;
