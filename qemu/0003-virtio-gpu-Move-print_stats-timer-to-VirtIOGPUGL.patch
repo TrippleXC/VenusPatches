@@ -1,0 +1,73 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 03/13] virtio-gpu: Move print_stats timer to VirtIOGPUGL
+Date: Sun, 23 Jun 2024 18:23:33 +0300
+
+Move print_stats timer to VirtIOGPUGL for consistency with
+cmdq_resume_bh and fence_poll that are used only by GL device.
+
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-virgl.c  | 10 ++++++----
+ include/hw/virtio/virtio-gpu.h |  2 +-
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 91dce90f9176..a63d1f540f04 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -574,6 +574,7 @@ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
+ static void virtio_gpu_print_stats(void *opaque)
+ {
+     VirtIOGPU *g = opaque;
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
+     if (g->stats.requests) {
+         fprintf(stderr, "stats: vq req %4d, %3d -- 3D %4d (%5d)\n",
+@@ -588,7 +589,7 @@ static void virtio_gpu_print_stats(void *opaque)
+     } else {
+         fprintf(stderr, "stats: idle\r");
+     }
+-    timer_mod(g->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++    timer_mod(gl->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+ }
+ 
+ static void virtio_gpu_fence_poll(void *opaque)
+@@ -651,9 +652,10 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+                                   virtio_gpu_fence_poll, g);
+ 
+     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+-        g->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+-                                      virtio_gpu_print_stats, g);
+-        timer_mod(g->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++        gl->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                       virtio_gpu_print_stats, g);
++        timer_mod(gl->print_stats,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
+     }
+     return 0;
+ }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index bc69fd78a440..7ff989a45a5c 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -196,7 +196,6 @@ struct VirtIOGPU {
+     uint64_t hostmem;
+ 
+     bool processing_cmdq;
+-    QEMUTimer *print_stats;
+ 
+     uint32_t inflight;
+     struct {
+@@ -232,6 +231,7 @@ struct VirtIOGPUGL {
+     bool renderer_reset;
+ 
+     QEMUTimer *fence_poll;
++    QEMUTimer *print_stats;
+ };
+ 
+ struct VhostUserGPU {
+-- 
+2.45.2
+
+
+

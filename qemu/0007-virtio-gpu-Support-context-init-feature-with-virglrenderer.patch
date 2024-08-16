@@ -1,0 +1,71 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 07/13] virtio-gpu: Support context-init feature with
+ virglrenderer
+Date: Sun, 23 Jun 2024 18:23:37 +0300
+
+From: Huang Rui <ray.huang@amd.com>
+
+Patch "virtio-gpu: CONTEXT_INIT feature" has added the context_init
+feature flags. Expose this feature and support creating virglrenderer
+context with flags using context_id if libvirglrenderer is new enough.
+
+Originally-by: Antonio Caggiano <antonio.caggiano@collabora.com>
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Reviewed-by: Antonio Caggiano <quic_acaggian@quicinc.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-gl.c    |  4 ++++
+ hw/display/virtio-gpu-virgl.c | 20 ++++++++++++++++++--
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 0109244276fc..4fe9e6a0c21c 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -141,6 +141,10 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+     VIRTIO_GPU_BASE(g)->virtio_config.num_capsets =
+         virtio_gpu_virgl_get_num_capsets(g);
+ 
++#if VIRGL_VERSION_MAJOR >= 1
++    g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED;
++#endif
++
+     virtio_gpu_device_realize(qdev, errp);
+ }
+ 
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index ca6f4d6cbb58..b3aa444bcfa5 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -106,8 +106,24 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
+     trace_virtio_gpu_cmd_ctx_create(cc.hdr.ctx_id,
+                                     cc.debug_name);
+ 
+-    virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen,
+-                                  cc.debug_name);
++    if (cc.context_init) {
++        if (!virtio_gpu_context_init_enabled(g->parent_obj.conf)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "%s: context_init disabled",
++                          __func__);
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++
++#if VIRGL_VERSION_MAJOR >= 1
++        virgl_renderer_context_create_with_flags(cc.hdr.ctx_id,
++                                                 cc.context_init,
++                                                 cc.nlen,
++                                                 cc.debug_name);
++        return;
++#endif
++    }
++
++    virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen, cc.debug_name);
+ }
+ 
+ static void virgl_cmd_context_destroy(VirtIOGPU *g,
+-- 
+2.45.2
+
+
+

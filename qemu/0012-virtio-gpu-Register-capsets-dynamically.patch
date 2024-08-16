@@ -1,0 +1,127 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 12/13] virtio-gpu: Register capsets dynamically
+Date: Sun, 23 Jun 2024 18:23:42 +0300
+
+From: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+
+virtio_gpu_virgl_get_num_capsets will return "num_capsets", but we can't
+assume that capset_index 1 is always VIRGL2 once we'll support more capsets,
+like Venus and DRM capsets. Register capsets dynamically to avoid that problem.
+
+Reviewed-by: Manos Pitsidianakis <manos.pitsidianakis@linaro.org>
+Signed-off-by: Pierre-Eric Pelloux-Prayer <pierre-eric.pelloux-prayer@amd.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-gl.c     |  6 ++++--
+ hw/display/virtio-gpu-virgl.c  | 33 +++++++++++++++++++++------------
+ include/hw/virtio/virtio-gpu.h |  4 +++-
+ 3 files changed, 28 insertions(+), 15 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 5f27568d3ec8..20a7c316bb23 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -138,8 +138,8 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+     }
+ 
+     g->parent_obj.conf.flags |= (1 << VIRTIO_GPU_FLAG_VIRGL_ENABLED);
+-    VIRTIO_GPU_BASE(g)->virtio_config.num_capsets =
+-        virtio_gpu_virgl_get_num_capsets(g);
++    g->capset_ids = virtio_gpu_virgl_get_capsets(g);
++    VIRTIO_GPU_BASE(g)->virtio_config.num_capsets = g->capset_ids->len;
+ 
+ #if VIRGL_VERSION_MAJOR >= 1
+     g->parent_obj.conf.flags |= 1 << VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED;
+@@ -171,6 +171,8 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
+     }
+ 
+     gl->renderer_state = RS_START;
++
++    g_array_unref(g->capset_ids);
+ }
+ 
+ static void virtio_gpu_gl_class_init(ObjectClass *klass, void *data)
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index b2f4e215a7ad..5a881c58a11d 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -622,19 +622,13 @@ static void virgl_cmd_get_capset_info(VirtIOGPU *g,
+     VIRTIO_GPU_FILL_CMD(info);
+ 
+     memset(&resp, 0, sizeof(resp));
+-    if (info.capset_index == 0) {
+-        resp.capset_id = VIRTIO_GPU_CAPSET_VIRGL;
+-        virgl_renderer_get_cap_set(resp.capset_id,
+-                                   &resp.capset_max_version,
+-                                   &resp.capset_max_size);
+-    } else if (info.capset_index == 1) {
+-        resp.capset_id = VIRTIO_GPU_CAPSET_VIRGL2;
++
++    if (info.capset_index < g->capset_ids->len) {
++        resp.capset_id = g_array_index(g->capset_ids, uint32_t,
++                                       info.capset_index);
+         virgl_renderer_get_cap_set(resp.capset_id,
+                                    &resp.capset_max_version,
+                                    &resp.capset_max_size);
+-    } else {
+-        resp.capset_max_version = 0;
+-        resp.capset_max_size = 0;
+     }
+     resp.hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
+     virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
+@@ -1160,12 +1154,27 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+     return 0;
+ }
+ 
+-int virtio_gpu_virgl_get_num_capsets(VirtIOGPU *g)
++static void virtio_gpu_virgl_add_capset(GArray *capset_ids, uint32_t capset_id)
++{
++    g_array_append_val(capset_ids, capset_id);
++}
++
++GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
+ {
+     uint32_t capset2_max_ver, capset2_max_size;
++    GArray *capset_ids;
++
++    capset_ids = g_array_new(false, false, sizeof(uint32_t));
++
++    /* VIRGL is always supported. */
++    virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
++
+     virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+                               &capset2_max_ver,
+                               &capset2_max_size);
++    if (capset2_max_ver) {
++        virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
++    }
+ 
+-    return capset2_max_ver ? 2 : 1;
++    return capset_ids;
+ }
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 775005abb337..83232f4b4bfa 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -209,6 +209,8 @@ struct VirtIOGPU {
+         QTAILQ_HEAD(, VGPUDMABuf) bufs;
+         VGPUDMABuf *primary[VIRTIO_GPU_MAX_SCANOUTS];
+     } dmabuf;
++
++    GArray *capset_ids;
+ };
+ 
+ struct VirtIOGPUClass {
+@@ -354,6 +356,6 @@ void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
+ void virtio_gpu_virgl_reset(VirtIOGPU *g);
+ int virtio_gpu_virgl_init(VirtIOGPU *g);
+-int virtio_gpu_virgl_get_num_capsets(VirtIOGPU *g);
++GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);
+ 
+ #endif
+-- 
+2.45.2
+
+
+

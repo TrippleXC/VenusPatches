@@ -1,0 +1,51 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 10/13] virtio-gpu: Support suspension of commands
+ processing
+Date: Sun, 23 Jun 2024 18:23:40 +0300
+
+Check whether command processing has been finished; otherwise, stop
+processing commands and retry the command again next time. This allows
+us to support asynchronous execution of non-fenced commands needed for
+unmapping host blobs safely.
+
+Suggested-by: Akihiko Odaki <akihiko.odaki@daynix.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/trace-events | 1 +
+ hw/display/virtio-gpu.c | 6 ++++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/hw/display/trace-events b/hw/display/trace-events
+index e212710284ae..d26d663f9638 100644
+--- a/hw/display/trace-events
++++ b/hw/display/trace-events
+@@ -55,6 +55,7 @@ virtio_gpu_fence_ctrl(uint64_t fence, uint32_t type) "fence 0x%" PRIx64 ", type
+ virtio_gpu_fence_resp(uint64_t fence) "fence 0x%" PRIx64
+ virtio_gpu_inc_inflight_fences(uint32_t inflight) "in-flight+ %u"
+ virtio_gpu_dec_inflight_fences(uint32_t inflight) "in-flight- %u"
++virtio_gpu_cmd_suspended(uint32_t cmd) "cmd 0x%x"
+ 
+ # qxl.c
+ disable qxl_io_write_vga(int qid, const char *mode, uint32_t addr, uint32_t val) "%d %s addr=%u val=%u"
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 40a9d089710c..b348805fbaee 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1054,6 +1054,12 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
+         /* process command */
+         vgc->process_cmd(g, cmd);
+ 
++        /* command suspended */
++        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
++            trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
++            break;
++        }
++
+         QTAILQ_REMOVE(&g->cmdq, cmd, next);
+         if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+             g->stats.requests++;
+-- 
+2.45.2
+
+
+

@@ -1,0 +1,106 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 04/13] virtio-gpu: Handle virtio_gpu_virgl_init() failure
+Date: Sun, 23 Jun 2024 18:23:34 +0300
+
+virtio_gpu_virgl_init() may fail, leading to a further Qemu crash
+because Qemu assumes it never fails. Check virtio_gpu_virgl_init()
+return code and don't execute virtio commands on error. Failed
+virtio_gpu_virgl_init() will result in a timed out virtio commands
+for a guest OS.
+
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-gl.c     | 30 ++++++++++++++++++++++--------
+ include/hw/virtio/virtio-gpu.h | 11 +++++++++--
+ 2 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index e06be60dfbfc..21a1e9a05c5d 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -29,9 +29,14 @@ static void virtio_gpu_gl_update_cursor_data(VirtIOGPU *g,
+                                              struct virtio_gpu_scanout *s,
+                                              uint32_t resource_id)
+ {
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+     uint32_t width, height;
+     uint32_t pixels, *data;
+ 
++    if (gl->renderer_state != RS_INITED) {
++        return;
++    }
++
+     data = virgl_renderer_get_cursor_data(resource_id, &width, &height);
+     if (!data) {
+         return;
+@@ -65,13 +70,22 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
+         return;
+     }
+ 
+-    if (!gl->renderer_inited) {
+-        virtio_gpu_virgl_init(g);
+-        gl->renderer_inited = true;
+-    }
+-    if (gl->renderer_reset) {
+-        gl->renderer_reset = false;
++    switch (gl->renderer_state) {
++    case RS_RESET:
+         virtio_gpu_virgl_reset(g);
++        /* fallthrough */
++    case RS_START:
++        if (virtio_gpu_virgl_init(g)) {
++            gl->renderer_state = RS_INIT_FAILED;
++            return;
++        }
++
++        gl->renderer_state = RS_INITED;
++        break;
++    case RS_INIT_FAILED:
++        return;
++    case RS_INITED:
++        break;
+     }
+ 
+     cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+@@ -98,9 +112,9 @@ static void virtio_gpu_gl_reset(VirtIODevice *vdev)
+      * GL functions must be called with the associated GL context in main
+      * thread, and when the renderer is unblocked.
+      */
+-    if (gl->renderer_inited && !gl->renderer_reset) {
++    if (gl->renderer_state == RS_INITED) {
+         virtio_gpu_virgl_reset_scanout(g);
+-        gl->renderer_reset = true;
++        gl->renderer_state = RS_RESET;
+     }
+ }
+ 
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 7ff989a45a5c..6e71d799e5da 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -224,11 +224,18 @@ struct VirtIOGPUClass {
+                              Error **errp);
+ };
+ 
++/* VirtIOGPUGL renderer states */
++typedef enum {
++    RS_START,       /* starting state */
++    RS_INIT_FAILED, /* failed initialisation */
++    RS_INITED,      /* initialised and working */
++    RS_RESET,       /* inited and reset pending, moves to start after reset */
++} RenderState;
++
+ struct VirtIOGPUGL {
+     struct VirtIOGPU parent_obj;
+ 
+-    bool renderer_inited;
+-    bool renderer_reset;
++    RenderState renderer_state;
+ 
+     QEMUTimer *fence_poll;
+     QEMUTimer *print_stats;
+-- 
+2.45.2
+
+
+

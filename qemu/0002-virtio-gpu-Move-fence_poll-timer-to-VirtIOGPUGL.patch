@@ -1,0 +1,76 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 02/13] virtio-gpu: Move fence_poll timer to VirtIOGPUGL
+Date: Sun, 23 Jun 2024 18:23:32 +0300
+
+Move fence_poll timer to VirtIOGPUGL for consistency with cmdq_resume_bh
+that are used only by GL device.
+
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ hw/display/virtio-gpu-virgl.c  | 8 +++++---
+ include/hw/virtio/virtio-gpu.h | 3 ++-
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 14091b191ec0..91dce90f9176 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -594,11 +594,12 @@ static void virtio_gpu_print_stats(void *opaque)
+ static void virtio_gpu_fence_poll(void *opaque)
+ {
+     VirtIOGPU *g = opaque;
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
+     virgl_renderer_poll();
+     virtio_gpu_process_cmdq(g);
+     if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+-        timer_mod(g->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
++        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+     }
+ }
+ 
+@@ -626,6 +627,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+ {
+     int ret;
+     uint32_t flags = 0;
++    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+ 
+ #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
+     if (qemu_egl_display) {
+@@ -645,8 +647,8 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+         return ret;
+     }
+ 
+-    g->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+-                                 virtio_gpu_fence_poll, g);
++    gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                                  virtio_gpu_fence_poll, g);
+ 
+     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+         g->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 7a59379f5a7a..bc69fd78a440 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -196,7 +196,6 @@ struct VirtIOGPU {
+     uint64_t hostmem;
+ 
+     bool processing_cmdq;
+-    QEMUTimer *fence_poll;
+     QEMUTimer *print_stats;
+ 
+     uint32_t inflight;
+@@ -231,6 +230,8 @@ struct VirtIOGPUGL {
+ 
+     bool renderer_inited;
+     bool renderer_reset;
++
++    QEMUTimer *fence_poll;
+ };
+ 
+ struct VhostUserGPU {
+-- 
+2.45.2
+
+
+

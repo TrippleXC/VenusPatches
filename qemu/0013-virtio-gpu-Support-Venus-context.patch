@@ -1,0 +1,156 @@
+From: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+Subject: [PATCH v16 13/13] virtio-gpu: Support Venus context
+Date: Sun, 23 Jun 2024 18:23:43 +0300
+
+From: Antonio Caggiano <antonio.caggiano@collabora.com>
+
+Request Venus when initializing VirGL and if venus=true flag is set for
+virtio-gpu-gl device.
+
+Signed-off-by: Antonio Caggiano <antonio.caggiano@collabora.com>
+Signed-off-by: Huang Rui <ray.huang@amd.com>
+Signed-off-by: Dmitry Osipenko <dmitry.osipenko@collabora.com>
+---
+ docs/system/devices/virtio-gpu.rst | 11 +++++++++++
+ hw/display/virtio-gpu-gl.c         |  2 ++
+ hw/display/virtio-gpu-virgl.c      | 22 ++++++++++++++++++----
+ hw/display/virtio-gpu.c            | 15 +++++++++++++++
+ include/hw/virtio/virtio-gpu.h     |  3 +++
+ 5 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/docs/system/devices/virtio-gpu.rst b/docs/system/devices/virtio-gpu.rst
+index cb73dd799858..b7eb0fc0e727 100644
+--- a/docs/system/devices/virtio-gpu.rst
++++ b/docs/system/devices/virtio-gpu.rst
+@@ -71,6 +71,17 @@ representation back to OpenGL API calls.
+ .. _Gallium3D: https://www.freedesktop.org/wiki/Software/gallium/
+ .. _virglrenderer: https://gitlab.freedesktop.org/virgl/virglrenderer/
+ 
++Translation of Vulkan API calls is supported since release of `virglrenderer`_
++v1.0.0 using `venus`_ protocol. ``Venus`` virtio-gpu capability set ("capset")
++requires host blob support (``hostmem`` and ``blob`` fields) and should
++be enabled using ``venus`` field. The ``hostmem`` field specifies the size
++of virtio-gpu host memory window. This is typically between 256M and 8G.
++
++.. parsed-literal::
++    -device virtio-gpu-gl,hostmem=8G,blob=true,venus=true
++
++.. _venus: https://gitlab.freedesktop.org/virgl/venus-protocol/
++
+ virtio-gpu rutabaga
+ -------------------
+ 
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 20a7c316bb23..9be452547322 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -151,6 +151,8 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
+ static Property virtio_gpu_gl_properties[] = {
+     DEFINE_PROP_BIT("stats", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_STATS_ENABLED, false),
++    DEFINE_PROP_BIT("venus", VirtIOGPU, parent_obj.conf.flags,
++                    VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 5a881c58a11d..eedae7357f1a 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -1128,6 +1128,11 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
+         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
+     }
+ #endif
++#if VIRGL_VERSION_MAJOR >= 1
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++        flags |= VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER;
++    }
++#endif
+ 
+     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
+     if (ret != 0) {
+@@ -1161,7 +1166,7 @@ static void virtio_gpu_virgl_add_capset(GArray *capset_ids, uint32_t capset_id)
+ 
+ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
+ {
+-    uint32_t capset2_max_ver, capset2_max_size;
++    uint32_t capset_max_ver, capset_max_size;
+     GArray *capset_ids;
+ 
+     capset_ids = g_array_new(false, false, sizeof(uint32_t));
+@@ -1170,11 +1175,20 @@ GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g)
+     virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL);
+ 
+     virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VIRGL2,
+-                              &capset2_max_ver,
+-                              &capset2_max_size);
+-    if (capset2_max_ver) {
++                               &capset_max_ver,
++                               &capset_max_size);
++    if (capset_max_ver) {
+         virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VIRGL2);
+     }
+ 
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++        virgl_renderer_get_cap_set(VIRTIO_GPU_CAPSET_VENUS,
++                                   &capset_max_ver,
++                                   &capset_max_size);
++        if (capset_max_size) {
++            virtio_gpu_virgl_add_capset(capset_ids, VIRTIO_GPU_CAPSET_VENUS);
++        }
++    }
++
+     return capset_ids;
+ }
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index a5db2256a4bb..50b5634af13f 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1507,6 +1507,21 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
+ #endif
+     }
+ 
++    if (virtio_gpu_venus_enabled(g->parent_obj.conf)) {
++#ifdef VIRGL_VERSION_MAJOR
++    #if VIRGL_VERSION_MAJOR >= 1
++        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
++            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
++            error_setg(errp, "venus requires enabled blob and hostmem options");
++            return;
++        }
++    #else
++        error_setg(errp, "old virglrenderer, venus unsupported");
++        return;
++    #endif
++#endif
++    }
++
+     if (!virtio_gpu_base_device_realize(qdev,
+                                         virtio_gpu_handle_ctrl_cb,
+                                         virtio_gpu_handle_cursor_cb,
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 83232f4b4bfa..230fa0c4ee0a 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -99,6 +99,7 @@ enum virtio_gpu_base_conf_flags {
+     VIRTIO_GPU_FLAG_BLOB_ENABLED,
+     VIRTIO_GPU_FLAG_CONTEXT_INIT_ENABLED,
+     VIRTIO_GPU_FLAG_RUTABAGA_ENABLED,
++    VIRTIO_GPU_FLAG_VENUS_ENABLED,
+ };
+ 
+ #define virtio_gpu_virgl_enabled(_cfg) \
+@@ -117,6 +118,8 @@ enum virtio_gpu_base_conf_flags {
+     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_RUTABAGA_ENABLED))
+ #define virtio_gpu_hostmem_enabled(_cfg) \
+     (_cfg.hostmem > 0)
++#define virtio_gpu_venus_enabled(_cfg) \
++    (_cfg.flags & (1 << VIRTIO_GPU_FLAG_VENUS_ENABLED))
+ 
+ struct virtio_gpu_base_conf {
+     uint32_t max_outputs;
+-- 
+2.45.2
+
+
+
