@@ -1,63 +1,1707 @@
---- linux-6.8.4/drivers/gpu/drm/ttm/ttm_pool.c	2024-04-04 14:25:06.000000000 -0400
-+++ /usr/src/linux/drivers/gpu/drm/ttm/ttm_pool.c	2024-04-09 11:58:31.144205251 -0400
-@@ -83,6 +83,7 @@
- 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
- 	struct ttm_pool_dma *dma;
- 	struct page *p;
-+	unsigned int i;
- 	void *vaddr;
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 1/8] KVM: Assert that a page's refcount is elevated when marking accessed/dirty
+Date: Thu, 29 Feb 2024 11:57:52 +0900
+
+From: Sean Christopherson <seanjc@google.com>
+
+Assert that a page's refcount is elevated, i.e. that _something_ holds a
+reference to the page, when KVM marks a page as accessed and/or dirty.
+KVM typically doesn't hold a reference to pages that are mapped into the
+guest, e.g. to allow page migration, compaction, swap, etc., and instead
+relies on mmu_notifiers to react to changes in the primary MMU.
+
+Incorrect handling of mmu_notifier events (or similar mechanisms) can
+result in KVM keeping a mapping beyond the lifetime of the backing page,
+i.e. can (and often does) result in use-after-free.  Yelling if KVM marks
+a freed page as accessed/dirty doesn't prevent badness as KVM usually
+only does A/D updates when unmapping memory from the guest, i.e. the
+assertion fires well after an underlying bug has occurred, but yelling
+does help detect, triage, and debug use-after-free bugs.
+
+Note, the assertion must use page_count(), NOT page_ref_count()!  For
+hugepages, the returned struct page may be a tailpage and thus not have
+its own refcount.
+
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+---
+ virt/kvm/kvm_main.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 10bfc88a69f7..c5e4bf7c48f9 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3204,6 +3204,19 @@ EXPORT_SYMBOL_GPL(kvm_vcpu_unmap);
  
- 	/* Don't set the __GFP_COMP flag for higher order allocations.
-@@ -95,8 +96,10 @@
+ static bool kvm_is_ad_tracked_page(struct page *page)
+ {
++	/*
++	 * Assert that KVM isn't attempting to mark a freed page as Accessed or
++	 * Dirty, i.e. that KVM's MMU doesn't have a use-after-free bug.  KVM
++	 * (typically) doesn't pin pages that are mapped in KVM's MMU, and
++	 * instead relies on mmu_notifiers to know when a mapping needs to be
++	 * zapped/invalidated.  Unmapping from KVM's MMU must happen _before_
++	 * KVM returns from its mmu_notifier, i.e. the page should have an
++	 * elevated refcount at this point even though KVM doesn't hold a
++	 * reference of its own.
++	 */
++	if (WARN_ON_ONCE(!page_count(page)))
++		return false;
++
+ 	/*
+ 	 * Per page-flags.h, pages tagged PG_reserved "should in general not be
+ 	 * touched (e.g. set dirty) except by its owner".
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 2/8] KVM: Relax BUG_ON argument validation
+Date: Thu, 29 Feb 2024 11:57:53 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+hva_to_pfn() includes a check that KVM isn't trying to do an async page
+fault in a situation where it can't sleep. Downgrade this check from a
+BUG_ON() to a WARN_ON_ONCE(), since DoS'ing the guest (at worst) is
+better than bringing down the host.
+
+Suggested-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: David Stevens <stevensd@chromium.org>
+---
+ virt/kvm/kvm_main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index c5e4bf7c48f9..6f37d56fb2fc 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2979,7 +2979,7 @@ kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool interruptible,
+ 	int npages, r;
  
- 	if (!pool->use_dma_alloc) {
- 		p = alloc_pages_node(pool->nid, gfp_flags, order);
--		if (p)
-+		if (p) {
- 			p->private = order;
-+			goto ref_tail_pages;
-+		}
- 		return p;
+ 	/* we can do it either atomically or asynchronously, not both */
+-	BUG_ON(atomic && async);
++	WARN_ON_ONCE(atomic && async);
+ 
+ 	if (hva_to_pfn_fast(addr, write_fault, writable, &pfn))
+ 		return pfn;
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 3/8] KVM: mmu: Introduce kvm_follow_pfn()
+Date: Thu, 29 Feb 2024 11:57:54 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+Introduce kvm_follow_pfn(), which will replace __gfn_to_pfn_memslot().
+This initial implementation is just a refactor of the existing API which
+uses a single structure for passing the arguments. The arguments are
+further refactored as follows:
+
+ - The write_fault and interruptible boolean flags and the in
+   parameter part of async are replaced by setting FOLL_WRITE,
+   FOLL_INTERRUPTIBLE, and FOLL_NOWAIT respectively in a new flags
+   argument.
+ - The out parameter portion of the async parameter is now a return
+   value.
+ - The writable in/out parameter is split into a separate.
+   try_map_writable in parameter and writable out parameter.
+ - All other parameter are the same.
+
+Upcoming changes will add the ability to get a pfn without needing to
+take a ref to the underlying page.
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+---
+ include/linux/kvm_host.h |  18 ++++
+ virt/kvm/kvm_main.c      | 191 +++++++++++++++++++++------------------
+ virt/kvm/kvm_mm.h        |   3 +-
+ virt/kvm/pfncache.c      |  10 +-
+ 4 files changed, 131 insertions(+), 91 deletions(-)
+
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 7e7fd25b09b3..290db5133c36 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -97,6 +97,7 @@
+ #define KVM_PFN_ERR_HWPOISON	(KVM_PFN_ERR_MASK + 1)
+ #define KVM_PFN_ERR_RO_FAULT	(KVM_PFN_ERR_MASK + 2)
+ #define KVM_PFN_ERR_SIGPENDING	(KVM_PFN_ERR_MASK + 3)
++#define KVM_PFN_ERR_NEEDS_IO	(KVM_PFN_ERR_MASK + 4)
+ 
+ /*
+  * error pfns indicate that the gfn is in slot but faild to
+@@ -1209,6 +1210,23 @@ unsigned long gfn_to_hva_memslot_prot(struct kvm_memory_slot *slot, gfn_t gfn,
+ void kvm_release_page_clean(struct page *page);
+ void kvm_release_page_dirty(struct page *page);
+ 
++struct kvm_follow_pfn {
++	const struct kvm_memory_slot *slot;
++	gfn_t gfn;
++	/* FOLL_* flags modifying lookup behavior. */
++	unsigned int flags;
++	/* Whether this function can sleep. */
++	bool atomic;
++	/* Try to create a writable mapping even for a read fault. */
++	bool try_map_writable;
++
++	/* Outputs of kvm_follow_pfn */
++	hva_t hva;
++	bool writable;
++};
++
++kvm_pfn_t kvm_follow_pfn(struct kvm_follow_pfn *kfp);
++
+ kvm_pfn_t gfn_to_pfn(struct kvm *kvm, gfn_t gfn);
+ kvm_pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
+ 		      bool *writable);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 6f37d56fb2fc..575756c9c5b0 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2791,8 +2791,7 @@ static inline int check_user_page_hwpoison(unsigned long addr)
+  * true indicates success, otherwise false is returned.  It's also the
+  * only part that runs if we can in atomic context.
+  */
+-static bool hva_to_pfn_fast(unsigned long addr, bool write_fault,
+-			    bool *writable, kvm_pfn_t *pfn)
++static bool hva_to_pfn_fast(struct kvm_follow_pfn *kfp, kvm_pfn_t *pfn)
+ {
+ 	struct page *page[1];
+ 
+@@ -2801,14 +2800,12 @@ static bool hva_to_pfn_fast(unsigned long addr, bool write_fault,
+ 	 * or the caller allows to map a writable pfn for a read fault
+ 	 * request.
+ 	 */
+-	if (!(write_fault || writable))
++	if (!((kfp->flags & FOLL_WRITE) || kfp->try_map_writable))
+ 		return false;
+ 
+-	if (get_user_page_fast_only(addr, FOLL_WRITE, page)) {
++	if (get_user_page_fast_only(kfp->hva, FOLL_WRITE, page)) {
+ 		*pfn = page_to_pfn(page[0]);
+-
+-		if (writable)
+-			*writable = true;
++		kfp->writable = true;
+ 		return true;
  	}
  
-@@ -122,6 +125,23 @@
- 
- 	dma->vaddr = (unsigned long)vaddr | order;
- 	p->private = (unsigned long)dma;
-+
-+ref_tail_pages:
-+	/*
-+	 * KVM requires mapped tail pages to be refcounted because put_page()
-+	 * is invoked on them in the end of the page fault handling, and thus,
-+	 * tail pages need to be protected from the premature releasing.
-+	 * In fact, KVM page fault handler refuses to map tail pages to guest
-+	 * if they aren't refcounted because hva_to_pfn_remapped() checks the
-+	 * refcount specifically for this case.
-+	 *
-+	 * In particular, unreferenced tail pages result in a KVM "Bad address"
-+	 * failure for VMMs that use VirtIO-GPU when guest's Mesa VirGL driver
-+	 * accesses mapped host TTM buffer that contains tail pages.
-+	 */
-+	for (i = 1; i < 1 << order; i++)
-+		page_ref_inc(p + i);
-+
- 	return p;
- 
- error_free:
-@@ -135,6 +155,7 @@
+@@ -2819,8 +2816,7 @@ static bool hva_to_pfn_fast(unsigned long addr, bool write_fault,
+  * The slow path to get the pfn of the specified host virtual address,
+  * 1 indicates success, -errno is returned if error is detected.
+  */
+-static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
+-			   bool interruptible, bool *writable, kvm_pfn_t *pfn)
++static int hva_to_pfn_slow(struct kvm_follow_pfn *kfp, kvm_pfn_t *pfn)
  {
- 	unsigned long attr = DMA_ATTR_FORCE_CONTIGUOUS;
- 	struct ttm_pool_dma *dma;
-+	unsigned int i;
- 	void *vaddr;
+ 	/*
+ 	 * When a VCPU accesses a page that is not mapped into the secondary
+@@ -2833,32 +2829,24 @@ static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
+ 	 * Note that get_user_page_fast_only() and FOLL_WRITE for now
+ 	 * implicitly honor NUMA hinting faults and don't need this flag.
+ 	 */
+-	unsigned int flags = FOLL_HWPOISON | FOLL_HONOR_NUMA_FAULT;
++	unsigned int flags = FOLL_HWPOISON | FOLL_HONOR_NUMA_FAULT | kfp->flags;
+ 	struct page *page;
+ 	int npages;
  
- #ifdef CONFIG_X86
-@@ -144,6 +165,8 @@
- 	if (caching != ttm_cached && !PageHighMem(p))
- 		set_pages_wb(p, 1 << order);
+ 	might_sleep();
+ 
+-	if (writable)
+-		*writable = write_fault;
+-
+-	if (write_fault)
+-		flags |= FOLL_WRITE;
+-	if (async)
+-		flags |= FOLL_NOWAIT;
+-	if (interruptible)
+-		flags |= FOLL_INTERRUPTIBLE;
+-
+-	npages = get_user_pages_unlocked(addr, 1, &page, flags);
++	npages = get_user_pages_unlocked(kfp->hva, 1, &page, flags);
+ 	if (npages != 1)
+ 		return npages;
+ 
+-	/* map read fault as writable if possible */
+-	if (unlikely(!write_fault) && writable) {
++	if (kfp->flags & FOLL_WRITE) {
++		kfp->writable = true;
++	} else if (kfp->try_map_writable) {
+ 		struct page *wpage;
+ 
+-		if (get_user_page_fast_only(addr, FOLL_WRITE, &wpage)) {
+-			*writable = true;
++		/* map read fault as writable if possible */
++		if (get_user_page_fast_only(kfp->hva, FOLL_WRITE, &wpage)) {
++			kfp->writable = true;
+ 			put_page(page);
+ 			page = wpage;
+ 		}
+@@ -2889,23 +2877,23 @@ static int kvm_try_get_pfn(kvm_pfn_t pfn)
+ }
+ 
+ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+-			       unsigned long addr, bool write_fault,
+-			       bool *writable, kvm_pfn_t *p_pfn)
++			       struct kvm_follow_pfn *kfp, kvm_pfn_t *p_pfn)
+ {
+ 	kvm_pfn_t pfn;
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	spinlock_t *ptl;
++	bool write_fault = kfp->flags & FOLL_WRITE;
+ 	int r;
+ 
+-	r = follow_pte(vma->vm_mm, addr, &ptep, &ptl);
++	r = follow_pte(vma->vm_mm, kfp->hva, &ptep, &ptl);
+ 	if (r) {
+ 		/*
+ 		 * get_user_pages fails for VM_IO and VM_PFNMAP vmas and does
+ 		 * not call the fault handler, so do it here.
+ 		 */
+ 		bool unlocked = false;
+-		r = fixup_user_fault(current->mm, addr,
++		r = fixup_user_fault(current->mm, kfp->hva,
+ 				     (write_fault ? FAULT_FLAG_WRITE : 0),
+ 				     &unlocked);
+ 		if (unlocked)
+@@ -2913,7 +2901,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 		if (r)
+ 			return r;
+ 
+-		r = follow_pte(vma->vm_mm, addr, &ptep, &ptl);
++		r = follow_pte(vma->vm_mm, kfp->hva, &ptep, &ptl);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -2925,8 +2913,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 		goto out;
+ 	}
+ 
+-	if (writable)
+-		*writable = pte_write(pte);
++	kfp->writable = pte_write(pte);
+ 	pfn = pte_pfn(pte);
+ 
+ 	/*
+@@ -2957,38 +2944,28 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ }
+ 
+ /*
+- * Pin guest page in memory and return its pfn.
+- * @addr: host virtual address which maps memory to the guest
+- * @atomic: whether this function can sleep
+- * @interruptible: whether the process can be interrupted by non-fatal signals
+- * @async: whether this function need to wait IO complete if the
+- *         host page is not in the memory
+- * @write_fault: whether we should get a writable host page
+- * @writable: whether it allows to map a writable host page for !@write_fault
+- *
+- * The function will map a writable host page for these two cases:
+- * 1): @write_fault = true
+- * 2): @write_fault = false && @writable, @writable will tell the caller
+- *     whether the mapping is writable.
++ * Convert a hva to a pfn.
++ * @kfp: args struct for the conversion
+  */
+-kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool interruptible,
+-		     bool *async, bool write_fault, bool *writable)
++kvm_pfn_t hva_to_pfn(struct kvm_follow_pfn *kfp)
+ {
+ 	struct vm_area_struct *vma;
+ 	kvm_pfn_t pfn;
+ 	int npages, r;
+ 
+-	/* we can do it either atomically or asynchronously, not both */
+-	WARN_ON_ONCE(atomic && async);
++	/*
++	 * FOLL_NOWAIT is used for async page faults, which don't make sense
++	 * in an atomic context where the caller can't do async resolution.
++	 */
++	WARN_ON_ONCE(kfp->atomic && (kfp->flags & FOLL_NOWAIT));
+ 
+-	if (hva_to_pfn_fast(addr, write_fault, writable, &pfn))
++	if (hva_to_pfn_fast(kfp, &pfn))
+ 		return pfn;
+ 
+-	if (atomic)
++	if (kfp->atomic)
+ 		return KVM_PFN_ERR_FAULT;
+ 
+-	npages = hva_to_pfn_slow(addr, async, write_fault, interruptible,
+-				 writable, &pfn);
++	npages = hva_to_pfn_slow(kfp, &pfn);
+ 	if (npages == 1)
+ 		return pfn;
+ 	if (npages == -EINTR)
+@@ -2996,83 +2973,123 @@ kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool interruptible,
+ 
+ 	mmap_read_lock(current->mm);
+ 	if (npages == -EHWPOISON ||
+-	      (!async && check_user_page_hwpoison(addr))) {
++	    (!(kfp->flags & FOLL_NOWAIT) && check_user_page_hwpoison(kfp->hva))) {
+ 		pfn = KVM_PFN_ERR_HWPOISON;
+ 		goto exit;
+ 	}
+ 
+ retry:
+-	vma = vma_lookup(current->mm, addr);
++	vma = vma_lookup(current->mm, kfp->hva);
+ 
+ 	if (vma == NULL)
+ 		pfn = KVM_PFN_ERR_FAULT;
+ 	else if (vma->vm_flags & (VM_IO | VM_PFNMAP)) {
+-		r = hva_to_pfn_remapped(vma, addr, write_fault, writable, &pfn);
++		r = hva_to_pfn_remapped(vma, kfp, &pfn);
+ 		if (r == -EAGAIN)
+ 			goto retry;
+ 		if (r < 0)
+ 			pfn = KVM_PFN_ERR_FAULT;
+ 	} else {
+-		if (async && vma_is_valid(vma, write_fault))
+-			*async = true;
+-		pfn = KVM_PFN_ERR_FAULT;
++		if ((kfp->flags & FOLL_NOWAIT) &&
++		    vma_is_valid(vma, kfp->flags & FOLL_WRITE))
++			pfn = KVM_PFN_ERR_NEEDS_IO;
++		else
++			pfn = KVM_PFN_ERR_FAULT;
+ 	}
+ exit:
+ 	mmap_read_unlock(current->mm);
+ 	return pfn;
+ }
+ 
+-kvm_pfn_t __gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn,
+-			       bool atomic, bool interruptible, bool *async,
+-			       bool write_fault, bool *writable, hva_t *hva)
++kvm_pfn_t kvm_follow_pfn(struct kvm_follow_pfn *kfp)
+ {
+-	unsigned long addr = __gfn_to_hva_many(slot, gfn, NULL, write_fault);
++	kfp->writable = false;
++	kfp->hva = __gfn_to_hva_many(kfp->slot, kfp->gfn, NULL,
++				     kfp->flags & FOLL_WRITE);
+ 
+-	if (hva)
+-		*hva = addr;
+-
+-	if (addr == KVM_HVA_ERR_RO_BAD) {
+-		if (writable)
+-			*writable = false;
++	if (kfp->hva == KVM_HVA_ERR_RO_BAD)
+ 		return KVM_PFN_ERR_RO_FAULT;
+-	}
+ 
+-	if (kvm_is_error_hva(addr)) {
+-		if (writable)
+-			*writable = false;
++	if (kvm_is_error_hva(kfp->hva))
+ 		return KVM_PFN_NOSLOT;
+-	}
+ 
+-	/* Do not map writable pfn in the readonly memslot. */
+-	if (writable && memslot_is_readonly(slot)) {
+-		*writable = false;
+-		writable = NULL;
+-	}
++	if (memslot_is_readonly(kfp->slot))
++		kfp->try_map_writable = false;
++
++	return hva_to_pfn(kfp);
++}
++EXPORT_SYMBOL_GPL(kvm_follow_pfn);
++
++kvm_pfn_t __gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn,
++			       bool atomic, bool interruptible, bool *async,
++			       bool write_fault, bool *writable, hva_t *hva)
++{
++	kvm_pfn_t pfn;
++	struct kvm_follow_pfn kfp = {
++		.slot = slot,
++		.gfn = gfn,
++		.flags = 0,
++		.atomic = atomic,
++		.try_map_writable = !!writable,
++	};
++
++	if (write_fault)
++		kfp.flags |= FOLL_WRITE;
++	if (async)
++		kfp.flags |= FOLL_NOWAIT;
++	if (interruptible)
++		kfp.flags |= FOLL_INTERRUPTIBLE;
+ 
+-	return hva_to_pfn(addr, atomic, interruptible, async, write_fault,
+-			  writable);
++	pfn = kvm_follow_pfn(&kfp);
++	if (pfn == KVM_PFN_ERR_NEEDS_IO) {
++		*async = true;
++		pfn = KVM_PFN_ERR_FAULT;
++	}
++	if (hva)
++		*hva = kfp.hva;
++	if (writable)
++		*writable = kfp.writable;
++	return pfn;
+ }
+ EXPORT_SYMBOL_GPL(__gfn_to_pfn_memslot);
+ 
+ kvm_pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
+ 		      bool *writable)
+ {
+-	return __gfn_to_pfn_memslot(gfn_to_memslot(kvm, gfn), gfn, false, false,
+-				    NULL, write_fault, writable, NULL);
++	kvm_pfn_t pfn;
++	struct kvm_follow_pfn kfp = {
++		.slot = gfn_to_memslot(kvm, gfn),
++		.gfn = gfn,
++		.flags = write_fault ? FOLL_WRITE : 0,
++		.try_map_writable = !!writable,
++	};
++	pfn = kvm_follow_pfn(&kfp);
++	if (writable)
++		*writable = kfp.writable;
++	return pfn;
+ }
+ EXPORT_SYMBOL_GPL(gfn_to_pfn_prot);
+ 
+ kvm_pfn_t gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+-	return __gfn_to_pfn_memslot(slot, gfn, false, false, NULL, true,
+-				    NULL, NULL);
++	struct kvm_follow_pfn kfp = {
++		.slot = slot,
++		.gfn = gfn,
++		.flags = FOLL_WRITE,
++	};
++	return kvm_follow_pfn(&kfp);
+ }
+ EXPORT_SYMBOL_GPL(gfn_to_pfn_memslot);
+ 
+ kvm_pfn_t gfn_to_pfn_memslot_atomic(const struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+-	return __gfn_to_pfn_memslot(slot, gfn, true, false, NULL, true,
+-				    NULL, NULL);
++	struct kvm_follow_pfn kfp = {
++		.slot = slot,
++		.gfn = gfn,
++		.flags = FOLL_WRITE,
++		.atomic = true,
++	};
++	return kvm_follow_pfn(&kfp);
+ }
+ EXPORT_SYMBOL_GPL(gfn_to_pfn_memslot_atomic);
+ 
+diff --git a/virt/kvm/kvm_mm.h b/virt/kvm/kvm_mm.h
+index ecefc7ec51af..9ba61fbb727c 100644
+--- a/virt/kvm/kvm_mm.h
++++ b/virt/kvm/kvm_mm.h
+@@ -20,8 +20,7 @@
+ #define KVM_MMU_UNLOCK(kvm)		spin_unlock(&(kvm)->mmu_lock)
+ #endif /* KVM_HAVE_MMU_RWLOCK */
+ 
+-kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool interruptible,
+-		     bool *async, bool write_fault, bool *writable);
++kvm_pfn_t hva_to_pfn(struct kvm_follow_pfn *foll);
+ 
+ #ifdef CONFIG_HAVE_KVM_PFNCACHE
+ void gfn_to_pfn_cache_invalidate_start(struct kvm *kvm,
+diff --git a/virt/kvm/pfncache.c b/virt/kvm/pfncache.c
+index 2d6aba677830..1fb21c2ced5d 100644
+--- a/virt/kvm/pfncache.c
++++ b/virt/kvm/pfncache.c
+@@ -144,6 +144,12 @@ static kvm_pfn_t hva_to_pfn_retry(struct gfn_to_pfn_cache *gpc)
+ 	kvm_pfn_t new_pfn = KVM_PFN_ERR_FAULT;
+ 	void *new_khva = NULL;
+ 	unsigned long mmu_seq;
++	struct kvm_follow_pfn kfp = {
++		.slot = gpc->memslot,
++		.gfn = gpa_to_gfn(gpc->gpa),
++		.flags = FOLL_WRITE,
++		.hva = gpc->uhva,
++	};
+ 
+ 	lockdep_assert_held(&gpc->refresh_lock);
+ 
+@@ -182,8 +188,8 @@ static kvm_pfn_t hva_to_pfn_retry(struct gfn_to_pfn_cache *gpc)
+ 			cond_resched();
+ 		}
+ 
+-		/* We always request a writeable mapping */
+-		new_pfn = hva_to_pfn(gpc->uhva, false, false, NULL, true, NULL);
++		/* We always request a writable mapping */
++		new_pfn = hva_to_pfn(&kfp);
+ 		if (is_error_noslot_pfn(new_pfn))
+ 			goto out_error;
+ 
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 4/8] KVM: mmu: Improve handling of non-refcounted pfns
+Date: Thu, 29 Feb 2024 11:57:55 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+KVM's handling of non-refcounted pfns has two problems:
+
+ - pfns without struct pages can be accessed without the protection of a
+   mmu notifier. This is unsafe because KVM cannot monitor or control
+   the lifespan of such pfns, so it may continue to access the pfns
+   after they are freed.
+ - struct pages without refcounting (e.g. tail pages of non-compound
+   higher order pages) cannot be used at all, as gfn_to_pfn does not
+   provide enough information for callers to be able to avoid
+   underflowing the refcount.
+
+This patch extends the kvm_follow_pfn() API to properly handle these
+cases:
+
+  - First, it adds FOLL_GET to the list of supported flags, to indicate
+    whether or not the caller actually wants to take a refcount.
+  - Second, it adds a guarded_by_mmu_notifier parameter that is used to
+    avoid returning non-refcounted pages when the caller cannot safely
+    use them.
+  - Third, it adds an is_refcounted_page output parameter so that
+    callers can tell whether or not a pfn has a struct page that needs
+    to be passed to put_page.
+
+Since callers need to be updated on a case-by-case basis to pay
+attention to is_refcounted_page, the new behavior of returning
+non-refcounted pages is opt-in via the allow_non_refcounted_struct_page
+parameter. Once all callers have been updated, this parameter should be
+removed.
+
+The fact that non-refcounted pfns can no longer be accessed without mmu
+notifier protection by default is a breaking change. This patch provides
+a module parameter that system admins can use to re-enable the previous
+unsafe behavior when userspace is trusted not to migrate/free/etc
+non-refcounted pfns that are mapped into the guest. There is no timeline
+for updating everything in KVM to use mmu notifiers to alleviate the
+need for this module parameter.
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+---
+ include/linux/kvm_host.h |  29 +++++++++++
+ virt/kvm/kvm_main.c      | 104 +++++++++++++++++++++++++--------------
+ virt/kvm/pfncache.c      |   3 +-
+ 3 files changed, 99 insertions(+), 37 deletions(-)
+
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 290db5133c36..66516088bb0a 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1219,10 +1219,39 @@ struct kvm_follow_pfn {
+ 	bool atomic;
+ 	/* Try to create a writable mapping even for a read fault. */
+ 	bool try_map_writable;
++	/*
++	 * Usage of the returned pfn will be guared by a mmu notifier. If
++	 * FOLL_GET is not set, this must be true.
++	 */
++	bool guarded_by_mmu_notifier;
++	/*
++	 * When false, do not return pfns for non-refcounted struct pages.
++	 *
++	 * This allows callers to continue to rely on the legacy behavior
++	 * where pfs returned by gfn_to_pfn can be safely passed to
++	 * kvm_release_pfn without worrying about corrupting the refcount of
++	 * non-refcounted pages.
++	 *
++	 * Callers that opt into non-refcount struct pages need to track
++	 * whether or not the returned pages are refcounted and avoid touching
++	 * them when they are not. Some architectures may not have enough
++	 * free space in PTEs to do this.
++	 */
++	bool allow_non_refcounted_struct_page;
+ 
+ 	/* Outputs of kvm_follow_pfn */
+ 	hva_t hva;
+ 	bool writable;
++	/*
++	 * Non-NULL if the returned pfn is for a page with a valid refcount,
++	 * NULL if the returned pfn has no struct page or if the struct page is
++	 * not being refcounted (e.g. tail pages of non-compound higher order
++	 * allocations from IO/PFNMAP mappings).
++	 *
++	 * NOTE: This will still be set if FOLL_GET is not specified, but the
++	 *       returned page will not have an elevated refcount.
++	 */
++	struct page *refcounted_page;
+ };
+ 
+ kvm_pfn_t kvm_follow_pfn(struct kvm_follow_pfn *kfp);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 575756c9c5b0..984bcf8511e7 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -96,6 +96,13 @@ unsigned int halt_poll_ns_shrink;
+ module_param(halt_poll_ns_shrink, uint, 0644);
+ EXPORT_SYMBOL_GPL(halt_poll_ns_shrink);
+ 
++/*
++ * Allow non-refcounted struct pages and non-struct page memory to
++ * be mapped without MMU notifier protection.
++ */
++static bool allow_unsafe_mappings;
++module_param(allow_unsafe_mappings, bool, 0444);
++
+ /*
+  * Ordering of locks:
+  *
+@@ -2786,6 +2793,24 @@ static inline int check_user_page_hwpoison(unsigned long addr)
+ 	return rc == -EHWPOISON;
+ }
+ 
++static kvm_pfn_t kvm_follow_refcounted_pfn(struct kvm_follow_pfn *kfp,
++					   struct page *page)
++{
++	kvm_pfn_t pfn = page_to_pfn(page);
++
++	/*
++	 * FIXME: Ideally, KVM wouldn't pass FOLL_GET to gup() when the caller
++	 * doesn't want to grab a reference, but gup() doesn't support getting
++	 * just the pfn, i.e. FOLL_GET is effectively mandatory.  If that ever
++	 * changes, drop this and simply don't pass FOLL_GET to gup().
++	 */
++	if (!(kfp->flags & FOLL_GET))
++		put_page(page);
++
++	kfp->refcounted_page = page;
++	return pfn;
++}
++
+ /*
+  * The fast path to get the writable pfn which will be stored in @pfn,
+  * true indicates success, otherwise false is returned.  It's also the
+@@ -2804,7 +2829,7 @@ static bool hva_to_pfn_fast(struct kvm_follow_pfn *kfp, kvm_pfn_t *pfn)
+ 		return false;
+ 
+ 	if (get_user_page_fast_only(kfp->hva, FOLL_WRITE, page)) {
+-		*pfn = page_to_pfn(page[0]);
++		*pfn = kvm_follow_refcounted_pfn(kfp, page[0]);
+ 		kfp->writable = true;
+ 		return true;
+ 	}
+@@ -2851,7 +2876,7 @@ static int hva_to_pfn_slow(struct kvm_follow_pfn *kfp, kvm_pfn_t *pfn)
+ 			page = wpage;
+ 		}
+ 	}
+-	*pfn = page_to_pfn(page);
++	*pfn = kvm_follow_refcounted_pfn(kfp, page);
+ 	return npages;
+ }
+ 
+@@ -2866,16 +2891,6 @@ static bool vma_is_valid(struct vm_area_struct *vma, bool write_fault)
+ 	return true;
+ }
+ 
+-static int kvm_try_get_pfn(kvm_pfn_t pfn)
+-{
+-	struct page *page = kvm_pfn_to_refcounted_page(pfn);
+-
+-	if (!page)
+-		return 1;
+-
+-	return get_page_unless_zero(page);
+-}
+-
+ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 			       struct kvm_follow_pfn *kfp, kvm_pfn_t *p_pfn)
+ {
+@@ -2884,6 +2899,7 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 	pte_t pte;
+ 	spinlock_t *ptl;
+ 	bool write_fault = kfp->flags & FOLL_WRITE;
++	struct page *page;
+ 	int r;
+ 
+ 	r = follow_pte(vma->vm_mm, kfp->hva, &ptep, &ptl);
+@@ -2908,37 +2924,40 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
+ 
+ 	pte = ptep_get(ptep);
+ 
++	kfp->writable = pte_write(pte);
++	pfn = pte_pfn(pte);
++
++	page = kvm_pfn_to_refcounted_page(pfn);
++
+ 	if (write_fault && !pte_write(pte)) {
+ 		pfn = KVM_PFN_ERR_RO_FAULT;
+ 		goto out;
+ 	}
+ 
+-	kfp->writable = pte_write(pte);
+-	pfn = pte_pfn(pte);
++	if (!page)
++		goto out;
+ 
+ 	/*
+-	 * Get a reference here because callers of *hva_to_pfn* and
+-	 * *gfn_to_pfn* ultimately call kvm_release_pfn_clean on the
+-	 * returned pfn.  This is only needed if the VMA has VM_MIXEDMAP
+-	 * set, but the kvm_try_get_pfn/kvm_release_pfn_clean pair will
+-	 * simply do nothing for reserved pfns.
+-	 *
+-	 * Whoever called remap_pfn_range is also going to call e.g.
+-	 * unmap_mapping_range before the underlying pages are freed,
+-	 * causing a call to our MMU notifier.
+-	 *
+-	 * Certain IO or PFNMAP mappings can be backed with valid
+-	 * struct pages, but be allocated without refcounting e.g.,
+-	 * tail pages of non-compound higher order allocations, which
+-	 * would then underflow the refcount when the caller does the
+-	 * required put_page. Don't allow those pages here.
++	 * IO or PFNMAP mappings can be backed with valid struct pages but be
++	 * allocated without refcounting. We need to detect that to make sure we
++	 * only pass refcounted pages to kvm_follow_refcounted_pfn.
+ 	 */
+-	if (!kvm_try_get_pfn(pfn))
+-		r = -EFAULT;
++	if (get_page_unless_zero(page))
++		WARN_ON_ONCE(kvm_follow_refcounted_pfn(kfp, page) != pfn);
+ 
+ out:
+ 	pte_unmap_unlock(ptep, ptl);
+-	*p_pfn = pfn;
++
++	if (page && !kfp->refcounted_page &&
++	    !kfp->allow_non_refcounted_struct_page) {
++		r = -EFAULT;
++	} else if (!kfp->refcounted_page &&
++		   !kfp->guarded_by_mmu_notifier &&
++		   !allow_unsafe_mappings) {
++		r = -EFAULT;
++	} else {
++		*p_pfn = pfn;
++	}
+ 
+ 	return r;
+ }
+@@ -3004,6 +3023,11 @@ kvm_pfn_t hva_to_pfn(struct kvm_follow_pfn *kfp)
+ kvm_pfn_t kvm_follow_pfn(struct kvm_follow_pfn *kfp)
+ {
+ 	kfp->writable = false;
++	kfp->refcounted_page = NULL;
++
++	if (WARN_ON_ONCE(!(kfp->flags & FOLL_GET) && !kfp->guarded_by_mmu_notifier))
++		return KVM_PFN_ERR_FAULT;
++
+ 	kfp->hva = __gfn_to_hva_many(kfp->slot, kfp->gfn, NULL,
+ 				     kfp->flags & FOLL_WRITE);
+ 
+@@ -3028,9 +3052,10 @@ kvm_pfn_t __gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn,
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = slot,
+ 		.gfn = gfn,
+-		.flags = 0,
++		.flags = FOLL_GET,
+ 		.atomic = atomic,
+ 		.try_map_writable = !!writable,
++		.allow_non_refcounted_struct_page = false,
+ 	};
+ 
+ 	if (write_fault)
+@@ -3060,8 +3085,9 @@ kvm_pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = gfn_to_memslot(kvm, gfn),
+ 		.gfn = gfn,
+-		.flags = write_fault ? FOLL_WRITE : 0,
++		.flags = FOLL_GET | (write_fault ? FOLL_WRITE : 0),
+ 		.try_map_writable = !!writable,
++		.allow_non_refcounted_struct_page = false,
+ 	};
+ 	pfn = kvm_follow_pfn(&kfp);
+ 	if (writable)
+@@ -3075,7 +3101,8 @@ kvm_pfn_t gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn)
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = slot,
+ 		.gfn = gfn,
+-		.flags = FOLL_WRITE,
++		.flags = FOLL_GET | FOLL_WRITE,
++		.allow_non_refcounted_struct_page = false,
+ 	};
+ 	return kvm_follow_pfn(&kfp);
+ }
+@@ -3086,8 +3113,13 @@ kvm_pfn_t gfn_to_pfn_memslot_atomic(const struct kvm_memory_slot *slot, gfn_t gf
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = slot,
+ 		.gfn = gfn,
+-		.flags = FOLL_WRITE,
++		.flags = FOLL_GET | FOLL_WRITE,
+ 		.atomic = true,
++		/*
++		 * Setting atomic means __kvm_follow_pfn will never make it
++		 * to hva_to_pfn_remapped, so this is vacuously true.
++		 */
++		.allow_non_refcounted_struct_page = true,
+ 	};
+ 	return kvm_follow_pfn(&kfp);
+ }
+diff --git a/virt/kvm/pfncache.c b/virt/kvm/pfncache.c
+index 1fb21c2ced5d..6e82062ea203 100644
+--- a/virt/kvm/pfncache.c
++++ b/virt/kvm/pfncache.c
+@@ -147,8 +147,9 @@ static kvm_pfn_t hva_to_pfn_retry(struct gfn_to_pfn_cache *gpc)
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = gpc->memslot,
+ 		.gfn = gpa_to_gfn(gpc->gpa),
+-		.flags = FOLL_WRITE,
++		.flags = FOLL_GET | FOLL_WRITE,
+ 		.hva = gpc->uhva,
++		.allow_non_refcounted_struct_page = false,
+ 	};
+ 
+ 	lockdep_assert_held(&gpc->refresh_lock);
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 5/8] KVM: Migrate kvm_vcpu_map() to kvm_follow_pfn()
+Date: Thu, 29 Feb 2024 11:57:56 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+Migrate kvm_vcpu_map() to kvm_follow_pfn(). Track is_refcounted_page so
+that kvm_vcpu_unmap() know whether or not it needs to release the page.
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+---
+ include/linux/kvm_host.h |  2 +-
+ virt/kvm/kvm_main.c      | 24 ++++++++++++++----------
+ 2 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 66516088bb0a..59dc9fbafc08 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -295,6 +295,7 @@ struct kvm_host_map {
+ 	void *hva;
+ 	kvm_pfn_t pfn;
+ 	kvm_pfn_t gfn;
++	bool is_refcounted_page;
+ };
+ 
+ /*
+@@ -1270,7 +1271,6 @@ void kvm_release_pfn_dirty(kvm_pfn_t pfn);
+ void kvm_set_pfn_dirty(kvm_pfn_t pfn);
+ void kvm_set_pfn_accessed(kvm_pfn_t pfn);
+ 
+-void kvm_release_pfn(kvm_pfn_t pfn, bool dirty);
+ int kvm_read_guest_page(struct kvm *kvm, gfn_t gfn, void *data, int offset,
+ 			int len);
+ int kvm_read_guest(struct kvm *kvm, gpa_t gpa, void *data, unsigned long len);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 984bcf8511e7..17bf9fd6774e 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3184,24 +3184,22 @@ struct page *gfn_to_page(struct kvm *kvm, gfn_t gfn)
+ }
+ EXPORT_SYMBOL_GPL(gfn_to_page);
+ 
+-void kvm_release_pfn(kvm_pfn_t pfn, bool dirty)
+-{
+-	if (dirty)
+-		kvm_release_pfn_dirty(pfn);
+-	else
+-		kvm_release_pfn_clean(pfn);
+-}
+-
+ int kvm_vcpu_map(struct kvm_vcpu *vcpu, gfn_t gfn, struct kvm_host_map *map)
+ {
+ 	kvm_pfn_t pfn;
+ 	void *hva = NULL;
+ 	struct page *page = KVM_UNMAPPED_PAGE;
++	struct kvm_follow_pfn kfp = {
++		.slot = gfn_to_memslot(vcpu->kvm, gfn),
++		.gfn = gfn,
++		.flags = FOLL_GET | FOLL_WRITE,
++		.allow_non_refcounted_struct_page = true,
++	};
+ 
+ 	if (!map)
+ 		return -EINVAL;
+ 
+-	pfn = gfn_to_pfn(vcpu->kvm, gfn);
++	pfn = kvm_follow_pfn(&kfp);
+ 	if (is_error_noslot_pfn(pfn))
+ 		return -EINVAL;
+ 
+@@ -3221,6 +3219,7 @@ int kvm_vcpu_map(struct kvm_vcpu *vcpu, gfn_t gfn, struct kvm_host_map *map)
+ 	map->hva = hva;
+ 	map->pfn = pfn;
+ 	map->gfn = gfn;
++	map->is_refcounted_page = !!kfp.refcounted_page;
+ 
+ 	return 0;
+ }
+@@ -3244,7 +3243,12 @@ void kvm_vcpu_unmap(struct kvm_vcpu *vcpu, struct kvm_host_map *map, bool dirty)
+ 	if (dirty)
+ 		kvm_vcpu_mark_page_dirty(vcpu, map->gfn);
+ 
+-	kvm_release_pfn(map->pfn, dirty);
++	if (map->is_refcounted_page) {
++		if (dirty)
++			kvm_release_page_dirty(map->page);
++		else
++			kvm_release_page_clean(map->page);
++	}
+ 
+ 	map->hva = NULL;
+ 	map->page = NULL;
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 6/8] KVM: x86: Migrate to kvm_follow_pfn()
+Date: Thu, 29 Feb 2024 11:57:57 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+Migrate functions which need to be able to map non-refcounted struct
+pages to kvm_follow_pfn(). These functions are kvm_faultin_pfn() and
+reexecute_instruction(). The former requires replacing the async in/out
+parameter with FOLL_NOWAIT parameter and the KVM_PFN_ERR_NEEDS_IO return
+value (actually handling non-refcounted pages is complicated, so it will
+be done in a followup). The latter is a straightforward refactor.
+
+APIC related callers do not need to migrate because KVM controls the
+memslot, so it will always be regular memory. Prefetch related callers
+do not need to be migrated because atomic gfn_to_pfn() calls can never
+make it to hva_to_pfn_remapped().
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+---
+ arch/x86/kvm/mmu/mmu.c | 43 ++++++++++++++++++++++++++++++++----------
+ arch/x86/kvm/x86.c     | 11 +++++++++--
+ virt/kvm/kvm_main.c    | 11 ++++-------
+ 3 files changed, 46 insertions(+), 19 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 2d6cdeab1f8a..bbeb0f6783d7 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4331,7 +4331,14 @@ static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
+ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ {
+ 	struct kvm_memory_slot *slot = fault->slot;
+-	bool async;
++	struct kvm_follow_pfn kfp = {
++		.slot = slot,
++		.gfn = fault->gfn,
++		.flags = FOLL_GET | (fault->write ? FOLL_WRITE : 0),
++		.try_map_writable = true,
++		.guarded_by_mmu_notifier = true,
++		.allow_non_refcounted_struct_page = false,
++	};
+ 
+ 	/*
+ 	 * Retry the page fault if the gfn hit a memslot that is being deleted
+@@ -4368,12 +4375,20 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	if (fault->is_private)
+ 		return kvm_faultin_pfn_private(vcpu, fault);
+ 
+-	async = false;
+-	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, false, &async,
+-					  fault->write, &fault->map_writable,
+-					  &fault->hva);
+-	if (!async)
+-		return RET_PF_CONTINUE; /* *pfn has correct page already */
++	kfp.flags |= FOLL_NOWAIT;
++	fault->pfn = kvm_follow_pfn(&kfp);
++
++	if (!is_error_noslot_pfn(fault->pfn))
++		goto success;
++
++	/*
++	 * If kvm_follow_pfn() failed because I/O is needed to fault in the
++	 * page, then either set up an asynchronous #PF to do the I/O, or if
++	 * doing an async #PF isn't possible, retry kvm_follow_pfn() with
++	 * I/O allowed. All other failures are fatal, i.e. retrying won't help.
++	 */
++	if (fault->pfn != KVM_PFN_ERR_NEEDS_IO)
++		return RET_PF_CONTINUE;
+ 
+ 	if (!fault->prefetch && kvm_can_do_async_pf(vcpu)) {
+ 		trace_kvm_try_async_get_page(fault->addr, fault->gfn);
+@@ -4391,9 +4406,17 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	 * to wait for IO.  Note, gup always bails if it is unable to quickly
+ 	 * get a page and a fatal signal, i.e. SIGKILL, is pending.
+ 	 */
+-	fault->pfn = __gfn_to_pfn_memslot(slot, fault->gfn, false, true, NULL,
+-					  fault->write, &fault->map_writable,
+-					  &fault->hva);
++	kfp.flags |= FOLL_INTERRUPTIBLE;
++	kfp.flags &= ~FOLL_NOWAIT;
++	fault->pfn = kvm_follow_pfn(&kfp);
++
++	if (!is_error_noslot_pfn(fault->pfn))
++		goto success;
++
++	return RET_PF_CONTINUE;
++success:
++	fault->hva = kfp.hva;
++	fault->map_writable = kfp.writable;
+ 	return RET_PF_CONTINUE;
+ }
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 363b1c080205..f4a20e9bc7a6 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8747,6 +8747,7 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ {
+ 	gpa_t gpa = cr2_or_gpa;
+ 	kvm_pfn_t pfn;
++	struct kvm_follow_pfn kfp;
+ 
+ 	if (!(emulation_type & EMULTYPE_ALLOW_RETRY_PF))
+ 		return false;
+@@ -8776,7 +8777,13 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 	 * retry instruction -> write #PF -> emulation fail -> retry
+ 	 * instruction -> ...
+ 	 */
+-	pfn = gfn_to_pfn(vcpu->kvm, gpa_to_gfn(gpa));
++	kfp = (struct kvm_follow_pfn) {
++		.slot = gfn_to_memslot(vcpu->kvm, gpa_to_gfn(gpa)),
++		.gfn = gpa_to_gfn(gpa),
++		.flags = FOLL_GET | FOLL_WRITE,
++		.allow_non_refcounted_struct_page = true,
++	};
++	pfn = kvm_follow_pfn(&kfp);
+ 
+ 	/*
+ 	 * If the instruction failed on the error pfn, it can not be fixed,
+@@ -8785,7 +8792,7 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 	if (is_error_noslot_pfn(pfn))
+ 		return false;
+ 
+-	kvm_release_pfn_clean(pfn);
++	kvm_release_page_clean(kfp.refcounted_page);
+ 
+ 	/* The instructions are well-emulated on direct mmu. */
+ 	if (vcpu->arch.mmu->root_role.direct) {
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 17bf9fd6774e..24e2269339cb 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3293,6 +3293,9 @@ void kvm_release_page_clean(struct page *page)
+ {
+ 	WARN_ON(is_error_page(page));
+ 
++	if (!page)
++		return;
++
+ 	kvm_set_page_accessed(page);
+ 	put_page(page);
+ }
+@@ -3300,16 +3303,10 @@ EXPORT_SYMBOL_GPL(kvm_release_page_clean);
+ 
+ void kvm_release_pfn_clean(kvm_pfn_t pfn)
+ {
+-	struct page *page;
+-
+ 	if (is_error_noslot_pfn(pfn))
+ 		return;
+ 
+-	page = kvm_pfn_to_refcounted_page(pfn);
+-	if (!page)
+-		return;
+-
+-	kvm_release_page_clean(page);
++	kvm_release_page_clean(kvm_pfn_to_refcounted_page(pfn));
+ }
+ EXPORT_SYMBOL_GPL(kvm_release_pfn_clean);
+ 
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 7/8] KVM: x86/mmu: Track if sptes refer to refcounted pages
+Date: Thu, 29 Feb 2024 11:57:58 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+Use one of the unused bits in EPT sptes to track whether or not an spte
+refers to a struct page that has a valid refcount, in preparation for
+adding support for mapping such pages into guests. The new bit is used
+to avoid triggering a page_count() == 0 warning and to avoid touching
+A/D bits of unknown usage.
+
+Non-EPT sptes don't have any free bits to use, so this tracking is not
+possible when TDP is disabled or on 32-bit x86.
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+---
+ arch/x86/kvm/mmu/mmu.c         | 47 ++++++++++++++++++++--------------
+ arch/x86/kvm/mmu/paging_tmpl.h |  5 ++--
+ arch/x86/kvm/mmu/spte.c        |  5 +++-
+ arch/x86/kvm/mmu/spte.h        | 16 +++++++++++-
+ arch/x86/kvm/mmu/tdp_mmu.c     | 21 ++++++++-------
+ include/linux/kvm_host.h       |  3 +++
+ virt/kvm/kvm_main.c            |  6 +++--
+ 7 files changed, 69 insertions(+), 34 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index bbeb0f6783d7..4936a8c5829b 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -541,12 +541,14 @@ static bool mmu_spte_update(u64 *sptep, u64 new_spte)
+ 
+ 	if (is_accessed_spte(old_spte) && !is_accessed_spte(new_spte)) {
+ 		flush = true;
+-		kvm_set_pfn_accessed(spte_to_pfn(old_spte));
++		if (is_refcounted_page_spte(old_spte))
++			kvm_set_page_accessed(pfn_to_page(spte_to_pfn(old_spte)));
+ 	}
+ 
+ 	if (is_dirty_spte(old_spte) && !is_dirty_spte(new_spte)) {
+ 		flush = true;
+-		kvm_set_pfn_dirty(spte_to_pfn(old_spte));
++		if (is_refcounted_page_spte(old_spte))
++			kvm_set_page_dirty(pfn_to_page(spte_to_pfn(old_spte)));
+ 	}
+ 
+ 	return flush;
+@@ -578,20 +580,23 @@ static u64 mmu_spte_clear_track_bits(struct kvm *kvm, u64 *sptep)
+ 
+ 	pfn = spte_to_pfn(old_spte);
+ 
+-	/*
+-	 * KVM doesn't hold a reference to any pages mapped into the guest, and
+-	 * instead uses the mmu_notifier to ensure that KVM unmaps any pages
+-	 * before they are reclaimed.  Sanity check that, if the pfn is backed
+-	 * by a refcounted page, the refcount is elevated.
+-	 */
+-	page = kvm_pfn_to_refcounted_page(pfn);
+-	WARN_ON_ONCE(page && !page_count(page));
++	if (is_refcounted_page_spte(old_spte)) {
++		/*
++		 * KVM doesn't hold a reference to any pages mapped into the
++		 * guest, and instead uses the mmu_notifier to ensure that KVM
++		 * unmaps any pages before they are reclaimed. Sanity check
++		 * that, if the pfn is backed by a refcounted page, the
++		 * refcount is elevated.
++		 */
++		page = kvm_pfn_to_refcounted_page(pfn);
++		WARN_ON_ONCE(!page || !page_count(page));
+ 
+-	if (is_accessed_spte(old_spte))
+-		kvm_set_pfn_accessed(pfn);
++		if (is_accessed_spte(old_spte))
++			kvm_set_page_accessed(pfn_to_page(pfn));
+ 
+-	if (is_dirty_spte(old_spte))
+-		kvm_set_pfn_dirty(pfn);
++		if (is_dirty_spte(old_spte))
++			kvm_set_page_dirty(pfn_to_page(pfn));
++	}
+ 
+ 	return old_spte;
+ }
+@@ -627,8 +632,8 @@ static bool mmu_spte_age(u64 *sptep)
+ 		 * Capture the dirty status of the page, so that it doesn't get
+ 		 * lost when the SPTE is marked for access tracking.
+ 		 */
+-		if (is_writable_pte(spte))
+-			kvm_set_pfn_dirty(spte_to_pfn(spte));
++		if (is_writable_pte(spte) && is_refcounted_page_spte(spte))
++			kvm_set_page_dirty(pfn_to_page(spte_to_pfn(spte)));
+ 
+ 		spte = mark_spte_for_access_track(spte);
+ 		mmu_spte_update_no_track(sptep, spte);
+@@ -1267,8 +1272,8 @@ static bool spte_wrprot_for_clear_dirty(u64 *sptep)
+ {
+ 	bool was_writable = test_and_clear_bit(PT_WRITABLE_SHIFT,
+ 					       (unsigned long *)sptep);
+-	if (was_writable && !spte_ad_enabled(*sptep))
+-		kvm_set_pfn_dirty(spte_to_pfn(*sptep));
++	if (was_writable && !spte_ad_enabled(*sptep) && is_refcounted_page_spte(*sptep))
++		kvm_set_page_dirty(pfn_to_page(spte_to_pfn(*sptep)));
+ 
+ 	return was_writable;
+ }
+@@ -2946,7 +2951,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ 	}
+ 
+ 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
+-			   true, host_writable, &spte);
++			   true, host_writable, true, &spte);
+ 
+ 	if (*sptep == spte) {
+ 		ret = RET_PF_SPURIOUS;
+@@ -5999,6 +6004,10 @@ void kvm_configure_mmu(bool enable_tdp, int tdp_forced_root_level,
+ 
+ #ifdef CONFIG_X86_64
+ 	tdp_mmu_enabled = tdp_mmu_allowed && tdp_enabled;
++
++	/* The SPTE_MMU_PAGE_REFCOUNTED bit is only available with EPT. */
++	if (enable_tdp)
++		shadow_refcounted_mask = SPTE_MMU_PAGE_REFCOUNTED;
  #endif
-+	for (i = 1; i < 1 << order; i++)
-+		page_ref_dec(p + i);
+ 	/*
+ 	 * max_huge_page_level reflects KVM's MMU capabilities irrespective
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 4d4e98fe4f35..c965f77ac4d5 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -902,7 +902,7 @@ static gpa_t FNAME(gva_to_gpa)(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+  */
+ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int i)
+ {
+-	bool host_writable;
++	bool host_writable, is_refcounted;
+ 	gpa_t first_pte_gpa;
+ 	u64 *sptep, spte;
+ 	struct kvm_memory_slot *slot;
+@@ -959,10 +959,11 @@ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int
+ 	sptep = &sp->spt[i];
+ 	spte = *sptep;
+ 	host_writable = spte & shadow_host_writable_mask;
++	is_refcounted = is_refcounted_page_spte(spte);
+ 	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+ 	make_spte(vcpu, sp, slot, pte_access, gfn,
+ 		  spte_to_pfn(spte), spte, true, false,
+-		  host_writable, &spte);
++		  host_writable, is_refcounted, &spte);
  
- 	if (!pool || !pool->use_dma_alloc) {
- 		__free_pages(p, order);
+ 	return mmu_spte_update(sptep, spte);
+ }
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index 4a599130e9c9..e4a458b7e185 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -39,6 +39,7 @@ u64 __read_mostly shadow_memtype_mask;
+ u64 __read_mostly shadow_me_value;
+ u64 __read_mostly shadow_me_mask;
+ u64 __read_mostly shadow_acc_track_mask;
++u64 __read_mostly shadow_refcounted_mask;
+ 
+ u64 __read_mostly shadow_nonpresent_or_rsvd_mask;
+ u64 __read_mostly shadow_nonpresent_or_rsvd_lower_gfn_mask;
+@@ -138,7 +139,7 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	       const struct kvm_memory_slot *slot,
+ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
+ 	       u64 old_spte, bool prefetch, bool can_unsync,
+-	       bool host_writable, u64 *new_spte)
++	       bool host_writable, bool is_refcounted, u64 *new_spte)
+ {
+ 	int level = sp->role.level;
+ 	u64 spte = SPTE_MMU_PRESENT_MASK;
+@@ -188,6 +189,8 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 
+ 	if (level > PG_LEVEL_4K)
+ 		spte |= PT_PAGE_SIZE_MASK;
++	if (is_refcounted)
++		spte |= shadow_refcounted_mask;
+ 
+ 	if (shadow_memtype_mask)
+ 		spte |= static_call(kvm_x86_get_mt_mask)(vcpu, gfn,
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index a129951c9a88..6bf0069d8db6 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -96,6 +96,13 @@ static_assert(!(EPT_SPTE_MMU_WRITABLE & SHADOW_ACC_TRACK_SAVED_MASK));
+ /* Defined only to keep the above static asserts readable. */
+ #undef SHADOW_ACC_TRACK_SAVED_MASK
+ 
++/*
++ * Indicates that the SPTE refers to a page with a valid refcount. Only
++ * available for TDP SPTEs, since bits 62:52 are reserved for PAE paging,
++ * including NPT PAE.
++ */
++#define SPTE_MMU_PAGE_REFCOUNTED        BIT_ULL(59)
++
+ /*
+  * Due to limited space in PTEs, the MMIO generation is a 19 bit subset of
+  * the memslots generation and is derived as follows:
+@@ -345,6 +352,13 @@ static inline bool is_dirty_spte(u64 spte)
+ 	return dirty_mask ? spte & dirty_mask : spte & PT_WRITABLE_MASK;
+ }
+ 
++extern u64 __read_mostly shadow_refcounted_mask;
++
++static inline bool is_refcounted_page_spte(u64 spte)
++{
++	return !shadow_refcounted_mask || (spte & shadow_refcounted_mask);
++}
++
+ static inline u64 get_rsvd_bits(struct rsvd_bits_validate *rsvd_check, u64 pte,
+ 				int level)
+ {
+@@ -475,7 +489,7 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+ 	       const struct kvm_memory_slot *slot,
+ 	       unsigned int pte_access, gfn_t gfn, kvm_pfn_t pfn,
+ 	       u64 old_spte, bool prefetch, bool can_unsync,
+-	       bool host_writable, u64 *new_spte);
++	       bool host_writable, bool is_refcounted, u64 *new_spte);
+ u64 make_huge_page_split_spte(struct kvm *kvm, u64 huge_spte,
+ 		      	      union kvm_mmu_page_role role, int index);
+ u64 make_nonleaf_spte(u64 *child_pt, bool ad_disabled);
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 6ae19b4ee5b1..ee497fb78d90 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -414,6 +414,7 @@ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 	bool was_leaf = was_present && is_last_spte(old_spte, level);
+ 	bool is_leaf = is_present && is_last_spte(new_spte, level);
+ 	bool pfn_changed = spte_to_pfn(old_spte) != spte_to_pfn(new_spte);
++	bool is_refcounted = is_refcounted_page_spte(old_spte);
+ 
+ 	WARN_ON_ONCE(level > PT64_ROOT_MAX_LEVEL);
+ 	WARN_ON_ONCE(level < PG_LEVEL_4K);
+@@ -478,9 +479,9 @@ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 	if (is_leaf != was_leaf)
+ 		kvm_update_page_stats(kvm, level, is_leaf ? 1 : -1);
+ 
+-	if (was_leaf && is_dirty_spte(old_spte) &&
++	if (was_leaf && is_dirty_spte(old_spte) && is_refcounted &&
+ 	    (!is_present || !is_dirty_spte(new_spte) || pfn_changed))
+-		kvm_set_pfn_dirty(spte_to_pfn(old_spte));
++		kvm_set_page_dirty(pfn_to_page(spte_to_pfn(old_spte)));
+ 
+ 	/*
+ 	 * Recursively handle child PTs if the change removed a subtree from
+@@ -492,9 +493,9 @@ static void handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 	    (is_leaf || !is_present || WARN_ON_ONCE(pfn_changed)))
+ 		handle_removed_pt(kvm, spte_to_child_pt(old_spte, level), shared);
+ 
+-	if (was_leaf && is_accessed_spte(old_spte) &&
++	if (was_leaf && is_accessed_spte(old_spte) && is_refcounted &&
+ 	    (!is_present || !is_accessed_spte(new_spte) || pfn_changed))
+-		kvm_set_pfn_accessed(spte_to_pfn(old_spte));
++		kvm_set_page_accessed(pfn_to_page(spte_to_pfn(old_spte)));
+ }
+ 
+ /*
+@@ -956,8 +957,8 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ 		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
+ 	else
+ 		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
+-					 fault->pfn, iter->old_spte, fault->prefetch, true,
+-					 fault->map_writable, &new_spte);
++				   fault->pfn, iter->old_spte, fault->prefetch, true,
++				   fault->map_writable, true, &new_spte);
+ 
+ 	if (new_spte == iter->old_spte)
+ 		ret = RET_PF_SPURIOUS;
+@@ -1178,8 +1179,9 @@ static bool age_gfn_range(struct kvm *kvm, struct tdp_iter *iter,
+ 		 * Capture the dirty status of the page, so that it doesn't get
+ 		 * lost when the SPTE is marked for access tracking.
+ 		 */
+-		if (is_writable_pte(iter->old_spte))
+-			kvm_set_pfn_dirty(spte_to_pfn(iter->old_spte));
++		if (is_writable_pte(iter->old_spte) &&
++		    is_refcounted_page_spte(iter->old_spte))
++			kvm_set_page_dirty(pfn_to_page(spte_to_pfn(iter->old_spte)));
+ 
+ 		new_spte = mark_spte_for_access_track(iter->old_spte);
+ 		iter->old_spte = kvm_tdp_mmu_write_spte(iter->sptep,
+@@ -1602,7 +1604,8 @@ static void clear_dirty_pt_masked(struct kvm *kvm, struct kvm_mmu_page *root,
+ 		trace_kvm_tdp_mmu_spte_changed(iter.as_id, iter.gfn, iter.level,
+ 					       iter.old_spte,
+ 					       iter.old_spte & ~dbit);
+-		kvm_set_pfn_dirty(spte_to_pfn(iter.old_spte));
++		if (is_refcounted_page_spte(iter.old_spte))
++			kvm_set_page_dirty(pfn_to_page(spte_to_pfn(iter.old_spte)));
+ 	}
+ 
+ 	rcu_read_unlock();
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 59dc9fbafc08..d19a418df04b 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1211,6 +1211,9 @@ unsigned long gfn_to_hva_memslot_prot(struct kvm_memory_slot *slot, gfn_t gfn,
+ void kvm_release_page_clean(struct page *page);
+ void kvm_release_page_dirty(struct page *page);
+ 
++void kvm_set_page_accessed(struct page *page);
++void kvm_set_page_dirty(struct page *page);
++
+ struct kvm_follow_pfn {
+ 	const struct kvm_memory_slot *slot;
+ 	gfn_t gfn;
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 24e2269339cb..235c92830cdc 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3277,17 +3277,19 @@ static bool kvm_is_ad_tracked_page(struct page *page)
+ 	return !PageReserved(page);
+ }
+ 
+-static void kvm_set_page_dirty(struct page *page)
++void kvm_set_page_dirty(struct page *page)
+ {
+ 	if (kvm_is_ad_tracked_page(page))
+ 		SetPageDirty(page);
+ }
++EXPORT_SYMBOL_GPL(kvm_set_page_dirty);
+ 
+-static void kvm_set_page_accessed(struct page *page)
++void kvm_set_page_accessed(struct page *page)
+ {
+ 	if (kvm_is_ad_tracked_page(page))
+ 		mark_page_accessed(page);
+ }
++EXPORT_SYMBOL_GPL(kvm_set_page_accessed);
+ 
+ void kvm_release_page_clean(struct page *page)
+ {
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
+From: David Stevens <stevensd@chromium.org>
+Subject: [PATCH v11 8/8] KVM: x86/mmu: Handle non-refcounted pages
+Date: Thu, 29 Feb 2024 11:57:59 +0900
+
+From: David Stevens <stevensd@chromium.org>
+
+Handle non-refcounted pages in __kvm_faultin_pfn. This allows the
+host to map memory into the guest that is backed by non-refcounted
+struct pages - for example, the tail pages of higher order non-compound
+pages allocated by the amdgpu driver via ttm_pool_alloc_page.
+
+Signed-off-by: David Stevens <stevensd@chromium.org>
+---
+ arch/x86/kvm/mmu/mmu.c          | 24 +++++++++++++++++-------
+ arch/x86/kvm/mmu/mmu_internal.h |  2 ++
+ arch/x86/kvm/mmu/paging_tmpl.h  |  2 +-
+ arch/x86/kvm/mmu/tdp_mmu.c      |  3 ++-
+ include/linux/kvm_host.h        |  6 ++++--
+ virt/kvm/guest_memfd.c          |  8 ++++----
+ virt/kvm/kvm_main.c             | 10 ++++++++--
+ 7 files changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 4936a8c5829b..f9046912bb43 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -2924,6 +2924,11 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ 	bool host_writable = !fault || fault->map_writable;
+ 	bool prefetch = !fault || fault->prefetch;
+ 	bool write_fault = fault && fault->write;
++	/*
++	 * Prefetching uses gfn_to_page_many_atomic, which never gets
++	 * non-refcounted pages.
++	 */
++	bool is_refcounted = !fault || !!fault->accessed_page;
+ 
+ 	if (unlikely(is_noslot_pfn(pfn))) {
+ 		vcpu->stat.pf_mmio_spte_created++;
+@@ -2951,7 +2956,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
+ 	}
+ 
+ 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
+-			   true, host_writable, true, &spte);
++			   true, host_writable, is_refcounted, &spte);
+ 
+ 	if (*sptep == spte) {
+ 		ret = RET_PF_SPURIOUS;
+@@ -4319,8 +4324,8 @@ static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
+ 		return -EFAULT;
+ 	}
+ 
+-	r = kvm_gmem_get_pfn(vcpu->kvm, fault->slot, fault->gfn, &fault->pfn,
+-			     &max_order);
++	r = kvm_gmem_get_pfn(vcpu->kvm, fault->slot, fault->gfn,
++			     &fault->pfn, &fault->accessed_page, &max_order);
+ 	if (r) {
+ 		kvm_mmu_prepare_memory_fault_exit(vcpu, fault);
+ 		return r;
+@@ -4330,6 +4335,9 @@ static int kvm_faultin_pfn_private(struct kvm_vcpu *vcpu,
+ 			       fault->max_level);
+ 	fault->map_writable = !(fault->slot->flags & KVM_MEM_READONLY);
+ 
++	/* kvm_gmem_get_pfn takes a refcount, but accessed_page doesn't need it. */
++	put_page(fault->accessed_page);
++
+ 	return RET_PF_CONTINUE;
+ }
+ 
+@@ -4339,10 +4347,10 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	struct kvm_follow_pfn kfp = {
+ 		.slot = slot,
+ 		.gfn = fault->gfn,
+-		.flags = FOLL_GET | (fault->write ? FOLL_WRITE : 0),
++		.flags = fault->write ? FOLL_WRITE : 0,
+ 		.try_map_writable = true,
+ 		.guarded_by_mmu_notifier = true,
+-		.allow_non_refcounted_struct_page = false,
++		.allow_non_refcounted_struct_page = shadow_refcounted_mask,
+ 	};
+ 
+ 	/*
+@@ -4359,6 +4367,7 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 			fault->slot = NULL;
+ 			fault->pfn = KVM_PFN_NOSLOT;
+ 			fault->map_writable = false;
++			fault->accessed_page = NULL;
+ 			return RET_PF_CONTINUE;
+ 		}
+ 		/*
+@@ -4422,6 +4431,7 @@ static int __kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ success:
+ 	fault->hva = kfp.hva;
+ 	fault->map_writable = kfp.writable;
++	fault->accessed_page = kfp.refcounted_page;
+ 	return RET_PF_CONTINUE;
+ }
+ 
+@@ -4510,8 +4520,8 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	r = direct_map(vcpu, fault);
+ 
+ out_unlock:
++	kvm_set_page_accessed(fault->accessed_page);
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+-	kvm_release_pfn_clean(fault->pfn);
+ 	return r;
+ }
+ 
+@@ -4586,8 +4596,8 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
+ 	r = kvm_tdp_mmu_map(vcpu, fault);
+ 
+ out_unlock:
++	kvm_set_page_accessed(fault->accessed_page);
+ 	read_unlock(&vcpu->kvm->mmu_lock);
+-	kvm_release_pfn_clean(fault->pfn);
+ 	return r;
+ }
+ #endif
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 0669a8a668ca..0b05183600af 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -240,6 +240,8 @@ struct kvm_page_fault {
+ 	kvm_pfn_t pfn;
+ 	hva_t hva;
+ 	bool map_writable;
++	/* Does NOT have an elevated refcount */
++	struct page *accessed_page;
+ 
+ 	/*
+ 	 * Indicates the guest is trying to write a gfn that contains one or
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index c965f77ac4d5..b39dce802394 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -847,8 +847,8 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
+ 	r = FNAME(fetch)(vcpu, fault, &walker);
+ 
+ out_unlock:
++	kvm_set_page_accessed(fault->accessed_page);
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+-	kvm_release_pfn_clean(fault->pfn);
+ 	return r;
+ }
+ 
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index ee497fb78d90..0524be7c0796 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -958,7 +958,8 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
+ 	else
+ 		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
+ 				   fault->pfn, iter->old_spte, fault->prefetch, true,
+-				   fault->map_writable, true, &new_spte);
++				   fault->map_writable, !!fault->accessed_page,
++				   &new_spte);
+ 
+ 	if (new_spte == iter->old_spte)
+ 		ret = RET_PF_SPURIOUS;
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index d19a418df04b..ea34eae6cfa4 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -2426,11 +2426,13 @@ static inline bool kvm_mem_is_private(struct kvm *kvm, gfn_t gfn)
+ 
+ #ifdef CONFIG_KVM_PRIVATE_MEM
+ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+-		     gfn_t gfn, kvm_pfn_t *pfn, int *max_order);
++		     gfn_t gfn, kvm_pfn_t *pfn, struct page **page,
++		     int *max_order);
+ #else
+ static inline int kvm_gmem_get_pfn(struct kvm *kvm,
+ 				   struct kvm_memory_slot *slot, gfn_t gfn,
+-				   kvm_pfn_t *pfn, int *max_order)
++				   kvm_pfn_t *pfn, struct page **page,
++				   int *max_order)
+ {
+ 	KVM_BUG_ON(1, kvm);
+ 	return -EIO;
+diff --git a/virt/kvm/guest_memfd.c b/virt/kvm/guest_memfd.c
+index 0f4e0cf4f158..dabcca2ecc37 100644
+--- a/virt/kvm/guest_memfd.c
++++ b/virt/kvm/guest_memfd.c
+@@ -483,12 +483,12 @@ void kvm_gmem_unbind(struct kvm_memory_slot *slot)
+ }
+ 
+ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+-		     gfn_t gfn, kvm_pfn_t *pfn, int *max_order)
++		     gfn_t gfn, kvm_pfn_t *pfn, struct page **page,
++		     int *max_order)
+ {
+ 	pgoff_t index = gfn - slot->base_gfn + slot->gmem.pgoff;
+ 	struct kvm_gmem *gmem;
+ 	struct folio *folio;
+-	struct page *page;
+ 	struct file *file;
+ 	int r;
+ 
+@@ -514,9 +514,9 @@ int kvm_gmem_get_pfn(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 		goto out_unlock;
+ 	}
+ 
+-	page = folio_file_page(folio, index);
++	*page = folio_file_page(folio, index);
+ 
+-	*pfn = page_to_pfn(page);
++	*pfn = page_to_pfn(*page);
+ 	if (max_order)
+ 		*max_order = 0;
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 235c92830cdc..1f5d2a1e63a9 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -3284,11 +3284,17 @@ void kvm_set_page_dirty(struct page *page)
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_page_dirty);
+ 
+-void kvm_set_page_accessed(struct page *page)
++static void __kvm_set_page_accessed(struct page *page)
+ {
+ 	if (kvm_is_ad_tracked_page(page))
+ 		mark_page_accessed(page);
+ }
++
++void kvm_set_page_accessed(struct page *page)
++{
++	if (page)
++		__kvm_set_page_accessed(page);
++}
+ EXPORT_SYMBOL_GPL(kvm_set_page_accessed);
+ 
+ void kvm_release_page_clean(struct page *page)
+@@ -3298,7 +3304,7 @@ void kvm_release_page_clean(struct page *page)
+ 	if (!page)
+ 		return;
+ 
+-	kvm_set_page_accessed(page);
++	__kvm_set_page_accessed(page);
+ 	put_page(page);
+ }
+ EXPORT_SYMBOL_GPL(kvm_release_page_clean);
+-- 
+2.44.0.rc1.240.g4c46232300-goog
+
+
